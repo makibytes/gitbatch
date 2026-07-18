@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and upload assets for"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            os: linux
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            os: linux
+            arch: arm64
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            os: darwin
+            arch: amd64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            os: darwin
+            arch: arm64
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            os: windows
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          GITBATCH_VERSION: ${{ env.TAG }}
+      - name: Package
+        if: matrix.os != 'windows'
+        run: |
+          ASSET="gitbatch_${TAG}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
+          cp LICENSE "target/${{ matrix.target }}/release/"
+          tar -C "target/${{ matrix.target }}/release" -czf "$ASSET" gitbatch LICENSE
+          shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+      - name: Package (windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $asset = "gitbatch_${env:TAG}_windows_amd64.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/gitbatch.exe", "LICENSE" -DestinationPath $asset
+          (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower() + "  $asset" | Out-File -Encoding ascii "$asset.sha256"
+          echo "ASSET=$asset" >> $env:GITHUB_ENV
+      - name: Upload to release
+        shell: bash
+        run: gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber

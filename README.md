@@ -1,0 +1,257 @@
+[![MIT License](https://img.shields.io/badge/license-MIT-brightgreen.svg)](/LICENSE) [![CI](https://github.com/makibytes/gitbatch/actions/workflows/ci.yml/badge.svg)](https://github.com/makibytes/gitbatch/actions/workflows/ci.yml)
+
+## gitbatch
+
+Managing multiple git repositories is easier than ever. I (*was*) often end up working on many directories and manually pulling updates etc. To make this routine faster, I created a simple tool to handle this job. Although the focus is batch jobs, you can still do de facto micro management of your git repositories (e.g *add/reset, stash, commit etc.*). And for the more complex stuff, you can always open lazygit from within gitbatch.
+
+This is a Rust rewrite of the original [Go version](https://github.com/makibytes/gitbatch-legacy).
+
+Note: This is my AI playing field, so expect weird code.
+
+![gitbatch demo](.github/assets/gitbatch-demo.gif)
+
+## Installation
+
+Download the latest release artifact from the [GitHub Releases page](https://github.com/makibytes/gitbatch/releases/latest), then extract and place the binary on your `PATH`.
+
+Release artifacts include binaries for `linux` (amd64/arm64, fully static), `darwin` (amd64/arm64), and `windows` (amd64).
+
+Example (macOS/Linux):
+```bash
+# 1) Download the archive for your OS/architecture from the latest release page
+# 2) Extract it
+tar -xzf gitbatch_<version>_<os>_<arch>.tar.gz
+
+# 3) Move binary to PATH
+chmod +x gitbatch
+sudo mv gitbatch /usr/local/bin/gitbatch
+```
+
+Windows:
+1. Download the `windows` release artifact from [Releases](https://github.com/makibytes/gitbatch/releases/latest).
+2. Extract `gitbatch.exe`.
+3. Add its directory to your `PATH`.
+
+From source:
+```bash
+cargo install --path .    # from a checkout (reports version "dev")
+```
+
+gitbatch requires a `git` binary on `PATH`. The optional `Tab` handoff needs [lazygit](https://github.com/jesseduffield/lazygit) installed.
+
+## Use
+
+Run `gitbatch` from the parent directory of your git repositories. The TUI starts in **pull** mode and fetches all repositories automatically.
+
+```bash
+gitbatch                          # scan current directory
+gitbatch -d ~/src                 # scan a specific directory
+gitbatch -d ~/src -r 2            # scan recursively (depth 2)
+gitbatch -q                       # quick mode: batch pull without TUI
+gitbatch -q -m merge              # quick mode: batch merge
+gitbatch -m push                  # start TUI in push mode
+gitbatch --trace                  # append git command traces to gitbatch.log
+gitbatch --help                   # show all options
+```
+
+### Key bindings
+
+| Key | Action |
+| --- | --- |
+| `j` / `k`, arrows | Move selection |
+| `PgUp` / `PgDn` | Jump by 10 rows |
+| `g` / `G` | Jump to top / bottom |
+| `←` / `→` | Scroll message column |
+| `Space` | Queue / unqueue repository |
+| `Enter` | Run queued repositories, or run on current repo if nothing is queued |
+| `a` / `A` | Queue all / clear queue **and** all result markers |
+| `m` | Cycle mode: `Pull → Merge → Rebase → Push → Pull` |
+| `f` | Fetch current repository |
+| `p` | Pull current repository (fast-forward) |
+| `P` | Push current repository |
+| `b` | Branches panel |
+| `r` | Remotes / remote branches panel |
+| `s` | Status panel |
+| `v` | Commit log panel |
+| `R` | Refresh all repositories immediately |
+| `c` | Commit prompt |
+| `n` | New branch prompt (also inside the branches panel), or new worktree branch in worktree mode |
+| `u` | Set upstream tracking branch (e.g. `origin` or `origin/main`) |
+| `U` | Reset to upstream — confirm with `y` (mixed) or `H` (hard) |
+| `S` / `O` / `D` | Stash push / pop / drop (drop asks for confirmation) |
+| `W` | Toggle worktree mode |
+| `d` / `L` / `X` | Remove worktree / lock-unlock worktree / prune worktrees (in worktree mode) |
+| `t` | Toggle sorting by name / modification time |
+| `Tab` | Open lazygit for the selected repository |
+| `?` | Toggle help |
+| `q` / `Ctrl+C` | Quit (`q` closes an open panel first) |
+
+Inside the branches panel: `Space`/`c` checkout, `n` new branch, `d` delete, `D` force-delete. Inside the remotes panel: `Space`/`c` checkout, `d` delete remote branch. When several repos are tagged, panels show the branches common to all of them and every action fans out over the whole selection — destructive ones after a confirmation dialog.
+
+### Mode cycle
+
+The `m` key cycles through git operations:
+
+1. **Pull (FF)** — `git pull --ff-only` — merge only if it's a fast-forward (safe default; fails visibly if branches diverged)
+2. **Merge** — `git merge @{upstream}` — create a merge commit from upstream
+3. **Rebase** — `git pull --rebase` — rebase local commits on upstream (linear history)
+4. **Push** — `git push` — push local commits to remote (with a confirmation dialog for `--force` if rejected)
+
+Fetch is not part of the cycle: gitbatch fetches all repositories automatically at startup. Use `f` for an on-demand fetch of the current/tagged repos, or `-q -m fetch` for a headless fetch.
+
+### Worktree mode
+
+Press `W` to switch the overview into **worktree mode**. Repositories that share a common Git directory are grouped into a single worktree family so you can inspect the main worktree and linked worktrees together.
+
+Available worktree actions:
+
+- `n` — create a new linked worktree by entering a branch name and path
+- `d` — remove the selected linked worktree
+- `L` — lock or unlock the selected linked worktree
+- `X` — prune stale worktree metadata
+
+When you type a branch name in the worktree prompt, gitbatch prefills the path with a sibling directory named `<repo>.<branch-sanitized>`, for example `myproject.feature-auth`.
+
+The status panel (`s`) also reflects the selected worktree.
+
+### Configuration
+
+Configuration is stored at `$XDG_CONFIG_HOME/gitbatch/config.yml` (macOS: `~/Library/Application Support/gitbatch/config.yml`).
+
+```yaml
+# Directories to scan (used when no -d flag is given)
+paths:
+  - ~/projects
+  - ~/work/repos
+
+mode: pull          # default mode: pull | merge | rebase | push (fetch is quick-mode-only)
+recursion: 1        # directory scan depth
+quick: false        # start in quick mode by default
+trace: false        # append git command traces to gitbatch.log
+auto_stash: false   # stash a dirty tree before pull/merge/rebase, restore after
+```
+
+## Error handling
+
+Failures show per-repo with a categorized icon and color, plus the git message in the row:
+
+- **🔐 Authentication**: `?` icon (purple) — a credentials prompt opens and the operation is retried via `GIT_ASKPASS`
+- **⚠️ Conflicts**: amber — merge/rebase conflicts detected, use lazygit (`Tab`) to resolve
+- **🔄 Non-FF push**: `!` icon — a force-push confirmation dialog opens
+- **📡 Network**: gray — connection/timeout/unreachable-host failures
+- everything else: red with the git output inline
+
+### Conflict resolution
+
+When `git pull` or `git merge` results in conflicts:
+
+1. Conflicts are highlighted with the ⚠ icon and amber color
+2. The status panel (`s`) shows the working-tree state
+3. Press `Tab` to open lazygit for detailed conflict resolution
+4. After resolving in lazygit, return and press `Enter` to retry
+
+### Force-push safety
+
+When a push is rejected as non-fast-forward, a force-push confirmation dialog opens automatically. Confirm with `y` / `Enter`, or cancel with `n` / `Esc`. Use this **only when intentional** — force-push overwrites remote history.
+
+### Reset operations
+
+Press `U` to reset the current (or all tagged) repositories to upstream:
+
+- `y` / `Enter` — `git reset --mixed @{upstream}` — keep changes, unstage commits
+- `H` — `git reset --hard @{upstream}` — discard all local changes and commits
+
+Repos without an upstream are skipped automatically.
+
+### Auto-stash
+
+With `auto_stash: true` in the config, pull/merge/rebase on a dirty repository automatically runs `git stash push` first and `git stash pop` afterwards:
+
+- on success the result message ends with `auto-stash restored`
+- if the pop conflicts, the stash entry (`gitbatch auto-stash`) is kept and the message says so — resolve manually, the stash badge `{N}` marks the repo
+- if the operation itself fails, the stash is popped back immediately
+- untracked files are not stashed (plain `git stash push` semantics)
+
+Note: the `a` (queue-all) safety gating is unchanged — repos whose incoming changes overlap the dirty tree still aren't auto-queued; auto-stash applies when you run the operation.
+
+### Cherry-pick & tag management
+
+Not built into gitbatch — press `Tab` to handle cherry-picks and tags interactively in lazygit.
+
+## For git power users
+
+### Recommended workflows
+
+**Daily sync (safe default)**
+
+1. Start `gitbatch -d ~/projects -r 2`
+2. gitbatch fetches every repo automatically at startup; repos that can fast-forward cleanly are pre-tagged (`●`) for you
+3. Mode is "Pull (FF)" by default — press `Enter` → pulls all tagged repos
+4. Verify results: green `✓`, amber `⚠` for conflicts, red `✗` for FF failures
+5. Press `m` → "Merge" or "Rebase" for diverged branches, re-queue with `Space`/`a` and retry
+
+**Feature branch cleanup**: press `W` for worktree mode, `X` to prune dead worktrees, `L` to lock/unlock, then commit and `P` to push.
+
+**Staged release**: tag only your staging repos with `Space`, switch to "Push" mode, `Enter`, verify results are clean — then repeat for the production repos. Test with a subset first; the best batch operation is one you can undo.
+
+**Batch branch management**: tag repos with `Space`, press `b` — the panel shows the branches **common** to all tagged repos. `n` creates and checks out the same branch everywhere; later `d` on that branch deletes it everywhere (destructive variants always ask for confirmation first).
+
+### Error recovery
+
+- **Red ✗** (e.g. `no tracking information`): press `u` to set an upstream directly (accepts `origin` or `origin/branch`, works across all tagged repos), or `Tab` for lazygit diagnosis
+- **Gray ✗** (network): check connectivity, then `f` to retry the fetch
+- **Amber ⚠** (conflicts): `Tab` → resolve in lazygit → `git merge --continue` / `git rebase --continue` → back in gitbatch press `Enter` to retry
+- **`?`** (auth): the credentials prompt opens automatically and retries; if it fails again, check SSH keys or token permissions
+- **`!`** (force-push): review whether you really intend to rewrite history before confirming
+- **Bad merge**: press `U` — `y` for a mixed reset (keeps your changes), `H` for a hard reset (discards them) — or `Tab` for surgical history editing in lazygit
+
+### Visual indicators
+
+| Icon | Meaning |
+|------|---------|
+| ` ` (space) | Idle |
+| `●` | Queued — will run on Enter |
+| `⠋` | Working |
+| `✓` | Success |
+| `✗` | Failed (gray = network problem) |
+| `⚠` | Merge/rebase conflict |
+| `?` | Credentials needed |
+| `!` | Force-push requires confirmation |
+| `!` (muted) | Startup auto-fetch failed; `f` retries, `A` clears |
+
+| Branch indicator | Meaning |
+|------------------|---------|
+| `↖ +3` | 3 commits ahead (to push) |
+| `↘ +2` | 2 commits behind (to pull) |
+| `↖+1 ↘+1` | Diverged |
+| `~` / muted gray | No upstream set |
+
+### Pro tips
+
+- `t` toggles sorting between name and modification time — use modified sort to find stale repos
+- `←` / `→` scroll the message column to read long error messages
+- `a` then a glance at the `●` count is a quick sanity check before a mass operation; `A` clears the queue and all result markers in one stroke
+- `v` opens the commit log panel — check what you're about to push before switching to push mode
+- Stash workflow: `S` stash → pull → `O` pop — or set `auto_stash: true` and let gitbatch do exactly this around every pull/merge/rebase
+- Queue first, review, then press `Enter` — don't run blindly, and verify before force-pushes, hard resets, and batch deletes
+
+### Debugging
+
+Run with `--trace` (or `trace: true` in the config) and gitbatch appends every git invocation to `gitbatch.log` in the current directory:
+
+```
+[1718123456] cwd=/home/user/projects/repo1 code=0 cmd=git fetch --prune output=From github.com:user/repo1
+```
+
+## Credits
+
+- [ratatui](https://github.com/ratatui/ratatui) and [crossterm](https://github.com/crossterm-rs/crossterm) for the terminal user interface
+- [clap](https://github.com/clap-rs/clap) for command-line flags & options
+- [tokio](https://github.com/tokio-rs/tokio) for async runtime
+- [serde](https://github.com/serde-rs/serde) for configuration management
+- [lazygit](https://github.com/jesseduffield/lazygit) for everything gitbatch hands off
+- the original Go [gitbatch](https://github.com/makibytes/gitbatch-legacy) by Thorsten Hirsch and Ibrahim Serdar Acikgoz, which this project reimplements
+
+## License
+
+[MIT](/LICENSE) — Copyright (c) 2026 [Maki Bytes UG](https://github.com/makibytes). Derived from the MIT-licensed Go gitbatch by Thorsten Hirsch and Ibrahim Serdar Acikgoz.
