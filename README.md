@@ -4,10 +4,6 @@
 
 Managing multiple git repositories is easier than ever. I (*was*) often end up working on many directories and manually pulling updates etc. To make this routine faster, I created a simple tool to handle this job. Although the focus is batch jobs, you can still do de facto micro management of your git repositories (e.g *add/reset, stash, commit etc.*). And for the more complex stuff, you can always open lazygit from within gitbatch.
 
-This is a Rust rewrite of the original [Go version](https://github.com/makibytes/gitbatch-legacy).
-
-Note: This is my AI playing field, so expect weird code.
-
 ![gitbatch demo](.github/assets/gitbatch-demo.gif)
 
 ## Installation
@@ -32,10 +28,9 @@ Windows:
 2. Extract `gitbatch.exe`.
 3. Add its directory to your `PATH`.
 
-From source:
-```bash
-cargo install --path .    # from a checkout (reports version "dev")
-```
+From source (for developers and advanced users):
+1. install a recent version of Rust 
+2. run `cargo install --path .`
 
 gitbatch requires a `git` binary on `PATH`. The optional `Tab` handoff needs [lazygit](https://github.com/jesseduffield/lazygit) installed.
 
@@ -69,11 +64,9 @@ gitbatch --help                   # show all options
 | `f` | Fetch current repository |
 | `p` | Pull current repository (fast-forward) |
 | `P` | Push current repository |
-| `b` | Branches panel |
-| `r` | Remotes / remote branches panel |
+| `b` | Branches panel (local and remote branches) |
 | `s` | Status panel |
 | `v` | Commit log panel |
-| `R` | Refresh all repositories immediately |
 | `c` | Commit prompt |
 | `n` | New branch prompt (also inside the branches panel), or new worktree branch in worktree mode |
 | `u` | Set upstream tracking branch (e.g. `origin` or `origin/main`) |
@@ -86,7 +79,7 @@ gitbatch --help                   # show all options
 | `?` | Toggle help |
 | `q` / `Ctrl+C` | Quit (`q` closes an open panel first) |
 
-Inside the branches panel: `Space`/`c` checkout, `n` new branch, `d` delete, `D` force-delete. Inside the remotes panel: `Space`/`c` checkout, `d` delete remote branch. When several repos are tagged, panels show the branches common to all of them and every action fans out over the whole selection — destructive ones after a confirmation dialog.
+Inside the branches panel: `Space`/`c` checkout, `n` new branch, `d` delete, `D` force-delete. The panel lists local branches followed by remote branches; remote branches that are already tracked by a local branch are hidden (the tracking info on the local line covers them). Checking out a remote branch creates a local tracking branch; `d` on a remote branch deletes it on the remote. When several repos are tagged, panels show the branches common to all of them and every action fans out over the whole selection — destructive ones after a confirmation dialog.
 
 ### Mode cycle
 
@@ -95,7 +88,7 @@ The `m` key cycles through git operations:
 1. **Pull (FF)** — `git pull --ff-only` — merge only if it's a fast-forward (safe default; fails visibly if branches diverged)
 2. **Merge** — `git merge @{upstream}` — create a merge commit from upstream
 3. **Rebase** — `git pull --rebase` — rebase local commits on upstream (linear history)
-4. **Push** — `git push` — push local commits to remote (with a confirmation dialog for `--force` if rejected)
+4. **Push** — `git push` — push local commits to remote (with a confirmation dialog for `--force` if rejected). If the branch has no upstream yet, gitbatch pushes with `-u` so the remote branch is created and tracking is set — create a branch locally and simply push to publish it.
 
 Fetch is not part of the cycle: gitbatch fetches all repositories automatically at startup. Use `f` for an on-demand fetch of the current/tagged repos, or `-q -m fetch` for a headless fetch.
 
@@ -254,4 +247,4 @@ Run with `--trace` (or `trace: true` in the config) and gitbatch appends every g
 
 ## License
 
-[MIT](/LICENSE) — Copyright (c) 2026 [Maki Bytes UG](https://github.com/makibytes). Derived from the MIT-licensed Go gitbatch by Thorsten Hirsch and Ibrahim Serdar Acikgoz.
+[MIT](/LICENSE) — Copyright (c) 2026 [Maki Bytes UG](https://github.com/makibytes)

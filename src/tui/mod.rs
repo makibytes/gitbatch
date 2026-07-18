@@ -248,6 +248,41 @@ fn remote_short_ref(name: &str) -> Option<&str> {
     name.strip_prefix("remotes/")
 }
 
+/// From one local-branch line of `git branch --all -vv --no-abbrev` output,
+/// extract the upstream short ref (`origin/x`) out of the tracking bracket
+/// that follows the SHA, e.g. `[origin/x]` or `[origin/x: ahead 1]`.
+fn upstream_of_local_line(line: &str) -> Option<&str> {
+    let name = parse_branch_name(line)?;
+    if name.starts_with("remotes/") {
+        return None;
+    }
+    // Tokens: name, 40-char SHA, then optionally `[upstream...`.
+    let mut tokens = line.trim_start_matches(['*', '+', ' ']).split_whitespace();
+    tokens.next()?; // name
+    let sha = tokens.next()?;
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bracket = tokens.next()?.strip_prefix('[')?;
+    Some(bracket.trim_end_matches([']', ':']))
+}
+
+/// Drop `remotes/origin/x` rows from `git branch --all -vv` output when a
+/// local branch in the same output already tracks `origin/x` — the tracking
+/// info shown on the local line makes the remote row redundant.
+fn filter_tracked_remotes(output: &str) -> String {
+    let tracked: HashSet<&str> = output.lines().filter_map(upstream_of_local_line).collect();
+    output
+        .lines()
+        .filter(|line| {
+            parse_branch_name(line)
+                .and_then(remote_short_ref)
+                .is_none_or(|short| !tracked.contains(short))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ── Prompt editing helpers ────────────────────────────────────────────────────
 
 /// Byte offset of the char boundary before `idx` (0 if already at the start).
@@ -545,7 +580,6 @@ impl RepoView {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PanelKind {
     Branches,
-    Remotes,
     Commits,
     Status,
 }
@@ -1548,9 +1582,9 @@ impl App {
 
         let multi = self.has_multi_target();
 
-        // For Branches/Remotes with multiple tagged repos: show only branches
+        // For Branches with multiple tagged repos: show only branches
         // common to ALL targets (the intersection).
-        if multi && matches!(kind, PanelKind::Branches | PanelKind::Remotes) {
+        if multi && kind == PanelKind::Branches {
             let paths = self.target_paths();
             let n = paths.len();
             let runner = runner.clone();
@@ -1559,17 +1593,13 @@ impl App {
             // for the sum of the git round-trips.
             let outputs = future::try_join_all(paths.iter().map(|p| {
                 let runner = runner.clone();
-                async move {
-                    if kind == PanelKind::Branches {
-                        runner.branch_list(p).await
-                    } else {
-                        runner.remote_list(p).await
-                    }
-                }
+                async move { runner.branch_list(p).await }
             }))
             .await?;
-            let name_sets: Vec<HashSet<String>> =
-                outputs.iter().map(|o| parse_branch_names(o)).collect();
+            let name_sets: Vec<HashSet<String>> = outputs
+                .iter()
+                .map(|o| parse_branch_names(&filter_tracked_remotes(o)))
+                .collect();
 
             // Intersect all sets.
             let common = if let Some(first) = name_sets.first() {
@@ -1585,12 +1615,7 @@ impl App {
             let mut names: Vec<&str> = common.iter().map(|s| s.as_str()).collect();
             names.sort_unstable();
 
-            let title_label = if kind == PanelKind::Branches {
-                "Branches"
-            } else {
-                "Remotes"
-            };
-            let title = format!("{title_label} ({n} repos)");
+            let title = format!("Branches ({n} repos)");
             let content = names.join("\n");
 
             self.panel = Some(PanelState::new_navigable(kind, title, content));
@@ -1598,16 +1623,16 @@ impl App {
         }
 
         let (title, content) = match kind {
-            PanelKind::Branches => ("Branches".into(), runner.branch_list(&path).await?),
-            PanelKind::Remotes => ("Remotes".into(), runner.remote_list(&path).await?),
+            PanelKind::Branches => (
+                "Branches".into(),
+                filter_tracked_remotes(&runner.branch_list(&path).await?),
+            ),
             PanelKind::Commits => ("Commits".into(), runner.commit_log(&path).await?),
             PanelKind::Status => ("Status".into(), runner.status_text(&path).await?),
         };
 
         self.panel = Some(match kind {
-            PanelKind::Branches | PanelKind::Remotes => {
-                PanelState::new_navigable(kind, title, content)
-            }
+            PanelKind::Branches => PanelState::new_navigable(kind, title, content),
             _ => PanelState::new_text(kind, title, content),
         });
         Ok(())
@@ -1982,7 +2007,6 @@ impl App {
             KeyCode::Char('m') => self.mode = self.mode.cycle(),
             KeyCode::Char('t') => self.toggle_sort(),
             KeyCode::Char('b') => self.open_panel(PanelKind::Branches).await?,
-            KeyCode::Char('r') => self.open_panel(PanelKind::Remotes).await?,
             KeyCode::Char('s') => self.open_panel(PanelKind::Status).await?,
             KeyCode::Char('v') => self.open_panel(PanelKind::Commits).await?,
             KeyCode::Char('f') => self.run_action_on_targets(Mode::Fetch),
@@ -2063,7 +2087,6 @@ impl App {
                     self.apply_local_result(p, result).await?;
                 }
             }
-            KeyCode::Char('R') => self.spawn_refresh(),
             KeyCode::Tab => self.open_lazygit().await?,
             _ => {}
         }
@@ -2441,28 +2464,6 @@ impl App {
                 }
                 return Ok(true);
             }
-            KeyCode::Char('c') | KeyCode::Char(' ') if kind == PanelKind::Remotes => {
-                let name = self.selected_branch_name();
-                if let Some(name) = name {
-                    self.panel = None;
-                    if self.has_multi_target() {
-                        for path in self.target_paths() {
-                            self.spawn_local_op(path, LocalAction::CheckoutRemote(name.clone()));
-                        }
-                    } else {
-                        self.show_prompt_prefilled(PromptKind::CheckoutRemoteBranch, name);
-                    }
-                }
-                return Ok(true);
-            }
-            KeyCode::Char('d') if kind == PanelKind::Remotes => {
-                let name = self.selected_branch_name();
-                if let Some(name) = name {
-                    self.panel = None;
-                    self.remote_delete_flow(name);
-                }
-                return Ok(true);
-            }
             // Swallow everything else so main-list hotkeys don't fire behind the panel.
             _ => {}
         }
@@ -2726,46 +2727,47 @@ fn draw_title_bar(frame: &mut Frame, app: &App, area: Rect) {
         SortMode::Modified => "time",
     };
 
+    let base = Style::default()
+        .fg(C_TITLE_FG)
+        .bg(C_TITLE_BG)
+        .add_modifier(Modifier::BOLD);
+
     let left = format!(" gitbatch {}", crate::version::VERSION);
-    let right_parts: Vec<String> = [
-        format!("repos:{total_repos}"),
-        if queued > 0 {
-            format!("selected:{queued}")
-        } else {
-            String::new()
-        },
-        if working > 0 {
-            format!("working:{working}")
-        } else {
-            String::new()
-        },
-        format!("sort:{sort_label}"),
-        if app.worktree_mode {
-            "worktree".into()
-        } else {
-            String::new()
-        },
-        " ? help ".into(),
-    ]
-    .into_iter()
-    .filter(|s| !s.is_empty())
-    .collect();
-    let right = right_parts.join("  ");
+    let mut right_parts: Vec<Vec<Span>> = vec![vec![Span::raw(format!("repos:{total_repos}"))]];
+    if queued > 0 {
+        right_parts.push(vec![Span::raw(format!("selected:{queued}"))]);
+    }
+    if working > 0 {
+        right_parts.push(vec![Span::raw(format!("working:{working}"))]);
+    }
+    right_parts.push(vec![
+        Span::raw("sor"),
+        Span::styled("t", base.add_modifier(Modifier::UNDERLINED)),
+        Span::raw(format!(":{sort_label}")),
+    ]);
+    if app.worktree_mode {
+        right_parts.push(vec![Span::raw("worktree")]);
+    }
+    right_parts.push(vec![Span::raw(" ?:help ")]);
 
     let total_w = area.width as usize;
     let left_w = left.chars().count();
-    let right_w = right.chars().count();
+    let right_w: usize = right_parts
+        .iter()
+        .flatten()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>()
+        + 2 * (right_parts.len() - 1);
     let gap = total_w.saturating_sub(left_w + right_w);
 
-    frame.render_widget(
-        Paragraph::new(format!("{}{}{}", left, " ".repeat(gap), right)).style(
-            Style::default()
-                .fg(C_TITLE_FG)
-                .bg(C_TITLE_BG)
-                .add_modifier(Modifier::BOLD),
-        ),
-        area,
-    );
+    let mut spans: Vec<Span> = vec![Span::raw(left), Span::raw(" ".repeat(gap))];
+    for (i, part) in right_parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.extend(part);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
 }
 
 /// Shared per-row visuals — style, the cursor/icon/name/stash cell, and the
@@ -3080,24 +3082,23 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let right: &str = if app.worktree_mode {
-        "  n:new  d:rm  L:lock  X:prune  W:exit  ?:help "
+        "  n:new  d:rm  L:lock  X:prune  W:exit "
     } else if let Some(panel) = &app.panel {
         match panel.kind {
             PanelKind::Branches => "  j/k:nav  space:checkout  n:new  d/D:del  Esc:close ",
-            PanelKind::Remotes => "  j/k:nav  space:checkout  d:del  Esc:close ",
             _ => "  j/k:scroll  Esc:close ",
         }
     } else if let Some(repo) = app.repos.get(app.cursor) {
         match &repo.state {
-            RepoOpState::Success(_) | RepoOpState::Fail { .. } => "  c/Esc:clear  ?:help ",
-            RepoOpState::Working => "  working…  ?:help ",
-            _ if repo.snapshot.dirty => "  c:commit  S:stash  TAB:lazygit  ?:help ",
-            _ if repo.snapshot.branch.behind > 0 => "  p:pull  f:fetch  TAB:lazygit  ?:help ",
-            _ if repo.snapshot.branch.ahead > 0 => "  P:push  TAB:lazygit  ?:help ",
-            _ => "  m:mode  TAB:lazygit  ?:help ",
+            RepoOpState::Success(_) | RepoOpState::Fail { .. } => "  c/Esc:clear ",
+            RepoOpState::Working => "  working… ",
+            _ if repo.snapshot.dirty => "  c:commit  S:stash  TAB:lazygit ",
+            _ if repo.snapshot.branch.behind > 0 => "  p:pull  f:fetch  TAB:lazygit ",
+            _ if repo.snapshot.branch.ahead > 0 => "  P:push  TAB:lazygit ",
+            _ => "  m:mode  TAB:lazygit ",
         }
     } else {
-        "  m:mode  ?:help "
+        "  m:mode "
     };
     let right_w = right.chars().count();
     let total_w = area.width as usize;
@@ -3205,7 +3206,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, scroll: &mut usize) {
         kv_line("m", "cycle mode"),
         Line::from(""),
         section_line("Local"),
-        kv_line("c", "commit (Tab: desc)"),
+        kv_line("c", "commit"),
         kv_line("n", "new branch"),
         kv_line("u", "set upstream"),
         kv_line("U", "reset to upstream"),
@@ -3225,16 +3226,12 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, scroll: &mut usize) {
         kv_line("", "tagged repos when set"),
         section_line("Panels"),
         kv_line("b", "branches"),
-        kv_line("", "space/c checkout, n new"),
-        kv_line("", "d del, D force-del"),
-        kv_line("r", "remotes   space/c, d del"),
         kv_line("s", "status"),
         kv_line("v", "commits"),
         kv_line("q / Esc", "close panel"),
         Line::from(""),
         section_line("Other"),
         kv_line("t", "toggle sort"),
-        kv_line("R", "refresh"),
         kv_line("TAB", "lazygit"),
         kv_line("q / Ctrl+C", "quit"),
     ];
@@ -3362,16 +3359,6 @@ fn draw_panel_popup(frame: &mut Frame, area: Rect, panel: &PanelState, repo_head
             plain(" delete  "),
             key_span("D"),
             plain(" force-del  "),
-            key_span("Esc"),
-            plain(" close"),
-        ]),
-        PanelKind::Remotes => Line::from(vec![
-            key_span("j/k"),
-            plain(" navigate  "),
-            key_span("space/c"),
-            plain(" checkout  "),
-            key_span("d"),
-            plain(" delete  "),
             key_span("Esc"),
             plain(" close"),
         ]),
@@ -3830,6 +3817,39 @@ fn display_action(action: &RemoteAction) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_tracked_remotes_drops_only_tracked_remote_rows() {
+        let sha = "a".repeat(40);
+        let output = [
+            // tracked, plain bracket
+            format!("* main                {sha} [origin/main] tip"),
+            // tracked with counts
+            format!("  feature             {sha} [origin/feature: ahead 1, behind 2] wip"),
+            // upstream gone — remote row doesn't exist anyway, must not panic
+            format!("  stale               {sha} [origin/stale: gone] old"),
+            // local without upstream
+            format!("  local-only          {sha} no upstream here"),
+            // symbolic ref line is kept
+            "  remotes/origin/HEAD -> origin/main".to_string(),
+            // tracked by the locals above → dropped
+            format!("  remotes/origin/main {sha} tip"),
+            format!("  remotes/origin/feature {sha} wip"),
+            // remote-only branch → kept
+            format!("  remotes/origin/other {sha} other work"),
+        ]
+        .join("\n");
+
+        let filtered = filter_tracked_remotes(&output);
+        assert!(filtered.contains("* main"));
+        assert!(filtered.contains("  feature"));
+        assert!(filtered.contains("  stale"));
+        assert!(filtered.contains("local-only"));
+        assert!(filtered.contains("remotes/origin/HEAD -> origin/main"));
+        assert!(!filtered.contains("remotes/origin/main"));
+        assert!(!filtered.contains("remotes/origin/feature"));
+        assert!(filtered.contains("remotes/origin/other"));
+    }
 
     #[test]
     fn validate_branch_name_accepts_normal_names() {

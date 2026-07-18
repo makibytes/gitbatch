@@ -217,10 +217,33 @@ impl GitRunner {
                 .await
             }
             RemoteAction::Push { force } => {
-                if force {
-                    self.run_args(dir, &["push", "--force"], credentials).await
+                // A branch without an upstream can't plain-push; push with -u
+                // so the remote branch is created and tracking is set.
+                let has_upstream = self
+                    .run(dir, ["rev-parse", "--abbrev-ref", "@{upstream}"])
+                    .await
+                    .is_ok();
+                if has_upstream {
+                    if force {
+                        self.run_args(dir, &["push", "--force"], credentials).await
+                    } else {
+                        self.run_args(dir, &["push"], credentials).await
+                    }
                 } else {
-                    self.run_args(dir, &["push"], credentials).await
+                    let remotes = self.run_simple(dir, ["remote"]).await.unwrap_or_default();
+                    let remote = remotes
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .find(|&l| l == "origin")
+                        .or_else(|| remotes.lines().map(str::trim).find(|l| !l.is_empty()))
+                        .unwrap_or("origin")
+                        .to_string();
+                    let mut args = vec!["push", "-u", remote.as_str(), "HEAD"];
+                    if force {
+                        args.push("--force");
+                    }
+                    self.run_args(dir, &args, credentials).await
                 }
             }
         }
@@ -253,14 +276,6 @@ impl GitRunner {
         self.run_simple(
             dir,
             ["branch", "--all", "--verbose", "--verbose", "--no-abbrev"],
-        )
-        .await
-    }
-
-    pub async fn remote_list(&self, dir: &Path) -> Result<String> {
-        self.run_simple(
-            dir,
-            ["branch", "-r", "--verbose", "--verbose", "--no-abbrev"],
         )
         .await
     }
@@ -649,8 +664,28 @@ mod tests {
             .await
             .unwrap();
         git(&clone, ["fetch", "--prune"]);
-        let remotes = runner.remote_list(&clone).await.unwrap();
-        assert!(!remotes.contains("origin/zap"));
+        let branches = runner.branch_list(&clone).await.unwrap();
+        assert!(!branches.contains("origin/zap"));
+    }
+
+    #[tokio::test]
+    async fn push_without_upstream_creates_remote_branch_with_tracking() {
+        let (_root, clone) = init_repo_with_origin();
+        let runner = GitRunner::default();
+        git(&clone, ["checkout", "-b", "feature"]);
+
+        runner
+            .run_remote_action(&clone, RemoteAction::Push { force: false })
+            .await
+            .unwrap();
+
+        let upstream = runner
+            .run_simple(&clone, ["rev-parse", "--abbrev-ref", "@{upstream}"])
+            .await
+            .unwrap();
+        assert!(upstream.contains("origin/feature"), "{upstream}");
+        let branches = runner.branch_list(&clone).await.unwrap();
+        assert!(branches.contains("remotes/origin/feature"));
     }
 
     #[tokio::test]
