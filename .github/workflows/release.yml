@@ -22,6 +22,9 @@ jobs:
             runner: ubuntu-latest
             os: linux
             arch: amd64
+          # The runner's Ubuntu version doesn't affect Linux binary compatibility:
+          # musl targets are fully static, so they run on any distro incl. CentOS 9.
+          # ubuntu-26.04(-arm) is still public preview (June 2026); switch once GA.
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
             os: linux
@@ -43,12 +46,12 @@ jobs:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.95.0
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
