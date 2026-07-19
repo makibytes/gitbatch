@@ -78,25 +78,6 @@ impl AppError {
             || lower.contains("could not resolve host")
             || lower.contains("failed to connect")
     }
-
-    pub fn is_no_upstream(&self) -> bool {
-        let lower = self.to_string().to_lowercase();
-        lower.contains("no upstream")
-            || lower.contains("no tracking information")
-            || (lower.contains("@{upstream}") && lower.contains("no merge base"))
-    }
-
-    pub fn is_nothing_to_commit(&self) -> bool {
-        let lower = self.to_string().to_lowercase();
-        lower.contains("nothing to commit") || lower.contains("nothing added to commit")
-    }
-
-    pub fn is_dirty_working_tree(&self) -> bool {
-        let lower = self.to_string().to_lowercase();
-        lower.contains("not a valid object")
-            || lower.contains("error: your local changes")
-            || lower.contains("would be overwritten")
-    }
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ pub fn discover_repositories(roots: &[PathBuf], depth: usize) -> Result<Vec<Path
     let search_depth = if depth == 0 { 1 } else { depth };
 
     for _ in 0..search_depth {
-        let (next_search, found) = walk_once(&search)?;
+        let (next_search, found) = walk_once(&search);
         search = next_search;
         repositories.extend(found);
     }
@@ -38,7 +38,7 @@ pub fn discover_repositories(roots: &[PathBuf], depth: usize) -> Result<Vec<Path
     Ok(repositories)
 }
 
-fn walk_once(search: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+fn walk_once(search: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut next_search = Vec::new();
     let mut repositories = Vec::new();
 
@@ -71,7 +71,7 @@ fn walk_once(search: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
         }
     }
 
-    Ok((next_search, repositories))
+    (next_search, repositories)
 }
 
 pub fn is_git_repository(path: &Path) -> bool {

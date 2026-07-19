@@ -1,6 +1,6 @@
 use crate::{
-    cli::Cli, config::AppConfig, discovery::discover_repositories, git::GitRunner, quick, tui,
-    Result,
+    Result, cli::Cli, config::AppConfig, discovery::discover_repositories, git::GitRunner, quick,
+    tui,
 };
 
 pub async fn run(cli: Cli) -> Result<()> {

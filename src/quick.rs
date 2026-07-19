@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 
-use crate::{git::GitRunner, mode::Mode, AppError, Result};
+use crate::{AppError, Result, git::GitRunner, mode::Mode};
 
 pub async fn run(runner: &GitRunner, directories: Vec<PathBuf>, mode: Mode) -> Result<()> {
     let Some(mode) = mode.quick_mode() else {
@@ -10,8 +10,7 @@ pub async fn run(runner: &GitRunner, directories: Vec<PathBuf>, mode: Mode) -> R
     };
 
     let concurrency = std::thread::available_parallelism()
-        .map(|value| value.get() * 4)
-        .unwrap_or(4)
+        .map_or(4, |value| value.get() * 4)
         .max(4);
 
     let started = std::time::Instant::now();

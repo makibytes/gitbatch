@@ -6,7 +6,7 @@ use std::{
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::{cli::Cli, error::AppError, mode::Mode, Result};
+use crate::{Result, cli::Cli, error::AppError, mode::Mode};
 
 const APP_NAME: &str = "gitbatch";
 const CONFIG_FILE_NAME: &str = "config.yml";
@@ -64,7 +64,7 @@ impl AppConfig {
         let mut normalized_directories = Vec::with_capacity(directories.len());
         for directory in directories {
             if directory.exists() {
-                normalized_directories.push(normalize_path(&directory)?);
+                normalized_directories.push(normalize_path(&directory));
             }
         }
 
@@ -87,9 +87,8 @@ impl AppConfig {
 }
 
 pub fn config_dir_path() -> Result<PathBuf> {
-    let base = BaseDirs::new()
-        .map(|dirs| dirs.config_dir().to_path_buf())
-        .unwrap_or_else(std::env::temp_dir);
+    let base =
+        BaseDirs::new().map_or_else(std::env::temp_dir, |dirs| dirs.config_dir().to_path_buf());
     Ok(base.join(APP_NAME))
 }
 
@@ -131,8 +130,8 @@ fn load_or_create_config(path: &Path) -> Result<FileConfig> {
     Ok(config)
 }
 
-fn normalize_path(path: &Path) -> Result<PathBuf> {
-    Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+fn normalize_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]

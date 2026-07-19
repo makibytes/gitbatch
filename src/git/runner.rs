@@ -11,7 +11,7 @@ use std::{
 use regex::Regex;
 use tokio::{process::Command, time::timeout};
 
-use crate::{mode::Mode, AppError, Result};
+use crate::{AppError, Result, mode::Mode};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -412,7 +412,7 @@ impl GitRunner {
 
     /// Set upstream branch for tracking
     pub async fn set_upstream(&self, dir: &Path, remote: &str, branch: &str) -> Result<String> {
-        let tracking_ref = format!("{}/{}", remote, branch);
+        let tracking_ref = format!("{remote}/{branch}");
         self.run_simple(dir, ["branch", "-u", &tracking_ref]).await
     }
 
