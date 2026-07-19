@@ -3,7 +3,7 @@ use std::{
     time::SystemTime,
 };
 
-use crate::{git::GitRunner, AppError, Result};
+use crate::{AppError, Result, git::GitRunner};
 
 #[derive(Debug, Clone, Default)]
 pub struct BranchStatus {
@@ -98,10 +98,10 @@ impl RepositorySnapshot {
         }
 
         let metadata = std::fs::metadata(dir)?;
-        let name = dir
-            .file_name()
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_else(|| dir.display().to_string());
+        let name = dir.file_name().map_or_else(
+            || dir.display().to_string(),
+            |value| value.to_string_lossy().into_owned(),
+        );
 
         Ok(Self {
             path: dir.to_path_buf(),
