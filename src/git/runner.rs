@@ -112,7 +112,12 @@ impl GitRunner {
                 .join(" ")
         );
 
-        let askpass = credentials.and_then(|creds| AskPassScript::create(creds).ok());
+        let askpass = match credentials {
+            Some(creds) => Some(AskPassScript::create(creds).map_err(|error| {
+                AppError::Config(format!("failed to create askpass helper: {error}"))
+            })?),
+            None => None,
+        };
         let mut command = Command::new("git");
         command
             .args(&args_vec)
@@ -205,6 +210,8 @@ impl GitRunner {
                 .await
             }
             RemoteAction::Merge => {
+                self.run_args(dir, &["fetch", "--prune"], credentials)
+                    .await?;
                 self.run_args(dir, &["merge", "@{upstream}"], credentials)
                     .await
             }
@@ -343,6 +350,23 @@ impl GitRunner {
                 self.run_simple(dir, ["stash", "push", "-m", message]).await
             }
             _ => self.run_simple(dir, ["stash", "push"]).await,
+        }
+    }
+
+    pub async fn stash_push_include_untracked(
+        &self,
+        dir: &Path,
+        message: Option<&str>,
+    ) -> Result<String> {
+        match message {
+            Some(message) if !message.trim().is_empty() => {
+                self.run_simple(dir, ["stash", "push", "--include-untracked", "-m", message])
+                    .await
+            }
+            _ => {
+                self.run_simple(dir, ["stash", "push", "--include-untracked"])
+                    .await
+            }
         }
     }
 
@@ -611,6 +635,24 @@ mod tests {
         runner.stash_pop(repo.path()).await.unwrap();
         let after_pop = runner.status_text(repo.path()).await.unwrap();
         assert!(after_pop.contains("tracked.txt"));
+    }
+
+    #[tokio::test]
+    async fn stash_include_untracked_round_trip() {
+        let repo = init_repo();
+        let runner = GitRunner::default();
+        fs::write(repo.path().join("new.txt"), "new\n").unwrap();
+
+        runner
+            .stash_push_include_untracked(repo.path(), Some("savepoint"))
+            .await
+            .unwrap();
+        let after_stash = runner.status_text(repo.path()).await.unwrap();
+        assert!(!after_stash.contains("new.txt"));
+
+        runner.stash_pop(repo.path()).await.unwrap();
+        let after_pop = runner.status_text(repo.path()).await.unwrap();
+        assert!(after_pop.contains("new.txt"));
     }
 
     #[tokio::test]

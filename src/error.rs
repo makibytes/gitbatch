@@ -26,6 +26,8 @@ pub enum AppError {
     NotRepository(PathBuf),
     #[error("unsupported quick mode: {0}")]
     UnsupportedQuickMode(String),
+    #[error("batch completed with failures: {failed}/{total}")]
+    BatchFailures { failed: usize, total: usize },
 }
 
 pub type Result<T, E = AppError> = std::result::Result<T, E>;

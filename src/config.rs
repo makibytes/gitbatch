@@ -87,8 +87,9 @@ impl AppConfig {
 }
 
 pub fn config_dir_path() -> Result<PathBuf> {
-    let base =
-        BaseDirs::new().map_or_else(std::env::temp_dir, |dirs| dirs.config_dir().to_path_buf());
+    let base = BaseDirs::new()
+        .map(|dirs| dirs.config_dir().to_path_buf())
+        .ok_or_else(|| AppError::Config("could not determine user config directory".into()))?;
     Ok(base.join(APP_NAME))
 }
 

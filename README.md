@@ -49,6 +49,8 @@ gitbatch --trace                  # append git command traces to gitbatch.log
 gitbatch --help                   # show all options
 ```
 
+Quick mode exits with a non-zero status if at least one repository operation fails.
+
 ### Key bindings
 
 | Key | Action |
@@ -158,12 +160,12 @@ Repos without an upstream are skipped automatically.
 
 ### Auto-stash
 
-With `auto_stash: true` in the config, pull/merge/rebase on a dirty repository automatically runs `git stash push` first and `git stash pop` afterwards:
+With `auto_stash: true` in the config, pull/merge/rebase on a dirty repository automatically runs `git stash push --include-untracked` first and `git stash pop` afterwards:
 
 - on success the result message ends with `auto-stash restored`
 - if the pop conflicts, the stash entry (`gitbatch auto-stash`) is kept and the message says so — resolve manually, the stash badge `{N}` marks the repo
 - if the operation itself fails, the stash is popped back immediately
-- untracked files are not stashed (plain `git stash push` semantics)
+- untracked files are stashed too, so pull/rebase/merge can proceed on trees with new files
 
 Note: the `a` (queue-all) safety gating is unchanged — repos whose incoming changes overlap the dirty tree still aren't auto-queued; auto-stash applies when you run the operation.
 

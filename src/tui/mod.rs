@@ -37,6 +37,7 @@ const MIN_WIDTH: u16 = 50;
 const MIN_HEIGHT: u16 = 8;
 const TICK_MS: u64 = 80;
 const REFRESH_SECS: u64 = 30;
+const MAIN_PAGE_JUMP: isize = 10;
 
 /// Concurrency cap for background git operations: `available_parallelism * 4`, min 4.
 /// Matches the Go reference's `runtime.GOMAXPROCS(0) * 4` semaphore.
@@ -754,6 +755,10 @@ enum ConfirmAction {
     StashDrop {
         paths: Vec<PathBuf>,
     },
+    DeleteBranch {
+        name: String,
+        paths: Vec<PathBuf>,
+    },
     ForceDeleteBranch {
         name: String,
         paths: Vec<PathBuf>,
@@ -795,7 +800,9 @@ async fn run_remote_with_autostash(
     stash: bool,
 ) -> Result<String> {
     if stash {
-        runner.stash_push(path, Some("gitbatch auto-stash")).await?;
+        runner
+            .stash_push_include_untracked(path, Some("gitbatch auto-stash"))
+            .await?;
     }
     let result = match creds {
         Some(c) => {
@@ -1855,6 +1862,11 @@ impl App {
                     self.spawn_local_op(path, LocalAction::StashDrop);
                 }
             }
+            ConfirmAction::DeleteBranch { name, paths } => {
+                for path in paths {
+                    self.spawn_local_op(path, LocalAction::DeleteBranch(name.clone()));
+                }
+            }
             ConfirmAction::ForceDeleteBranch { name, paths } => {
                 for path in paths {
                     self.spawn_local_op(path, LocalAction::ForceDeleteBranch(name.clone()));
@@ -1935,11 +1947,13 @@ impl App {
     // ── Key handling ──────────────────────────────────────────────────────────
 
     async fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<bool> {
+        if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+            return Ok(true);
+        }
+
         // Allow quit during loading
         if self.loading {
-            return Ok(code == KeyCode::Char('q')
-                || code == KeyCode::Char('Q')
-                || (code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL)));
+            return Ok(code == KeyCode::Char('q') || code == KeyCode::Char('Q'));
         }
 
         if self.auth_prompt.is_some() {
@@ -1977,7 +1991,6 @@ impl App {
 
         match code {
             KeyCode::Char('q' | 'Q') => return Ok(true),
-            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return Ok(true),
             KeyCode::Char('?') => {
                 self.show_help = true;
                 self.help_scroll = 0;
@@ -2008,8 +2021,8 @@ impl App {
                     self.cursor = self.repos.len().saturating_sub(1);
                 }
             }
-            KeyCode::PageUp => self.move_cursor(-20),
-            KeyCode::PageDown => self.move_cursor(20),
+            KeyCode::PageUp => self.move_cursor(-MAIN_PAGE_JUMP),
+            KeyCode::PageDown => self.move_cursor(MAIN_PAGE_JUMP),
             KeyCode::Left => self.msg_scroll = self.msg_scroll.saturating_sub(4),
             KeyCode::Right => self.msg_scroll = self.msg_scroll.saturating_add(4),
             KeyCode::Char(' ') => self.toggle_queue(),
@@ -2445,9 +2458,13 @@ impl App {
                     if let Some(short) = remote_short_ref(&name).map(String::from) {
                         self.remote_delete_flow(short);
                     } else if self.has_multi_target() {
-                        for path in self.target_paths() {
-                            self.spawn_local_op(path, LocalAction::DeleteBranch(name.clone()));
-                        }
+                        let paths = self.target_paths();
+                        self.enqueue_confirm(ConfirmPromptState {
+                            title: "Delete Branch?",
+                            subject: format!("'{name}' in {} repos", paths.len()),
+                            warning: "Unmerged commits may be kept only in reflogs.".into(),
+                            action: ConfirmAction::DeleteBranch { name, paths },
+                        });
                     } else {
                         self.show_prompt_prefilled(PromptKind::DeleteBranch, name);
                     }
@@ -3953,6 +3970,26 @@ mod tests {
             RepoOpState::Fail { kind, .. } => assert_eq!(kind, FailKind::Network),
             _ => panic!("expected fail"),
         }
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_quits_even_when_prompt_is_open() {
+        let mut app = App::new(GitRunner::default(), Mode::Pull, false, 0);
+        app.loading = false;
+        app.prompt = Some(PromptState {
+            kind: PromptKind::Branch,
+            input: "feature/test".into(),
+            cursor: "feature/test".len(),
+            error: None,
+            description: String::new(),
+            commit_field: CommitField::Subject,
+        });
+
+        let quit = app
+            .handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            .await
+            .unwrap();
+        assert!(quit);
     }
 
     #[test]

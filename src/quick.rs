@@ -26,6 +26,7 @@ pub async fn run(runner: &GitRunner, directories: Vec<PathBuf>, mode: Mode) -> R
     .await;
 
     let total = results.len();
+    let mut failed = 0usize;
     for (directory, result) in results {
         match result {
             Ok(message) => {
@@ -35,15 +36,45 @@ pub async fn run(runner: &GitRunner, directories: Vec<PathBuf>, mode: Mode) -> R
                     println!("{}: {}", directory.display(), message.replace('\n', " | "));
                 }
             }
-            Err(error) => eprintln!(
-                "could not perform {} on {}: {}",
-                mode,
-                directory.display(),
-                error
-            ),
+            Err(error) => {
+                failed += 1;
+                eprintln!(
+                    "could not perform {} on {}: {}",
+                    mode,
+                    directory.display(),
+                    error
+                );
+            }
         }
     }
 
     println!("{total} repositories finished in: {:?}", started.elapsed());
+    if failed > 0 {
+        return Err(AppError::BatchFailures { failed, total });
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn returns_batch_failure_when_any_repo_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = run(
+            &GitRunner::default(),
+            vec![temp.path().to_path_buf()],
+            Mode::Pull,
+        )
+        .await;
+
+        match result {
+            Err(AppError::BatchFailures { failed, total }) => {
+                assert_eq!(failed, 1);
+                assert_eq!(total, 1);
+            }
+            other => panic!("expected batch failure, got {other:?}"),
+        }
+    }
 }
