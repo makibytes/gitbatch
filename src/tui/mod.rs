@@ -39,6 +39,12 @@ const TICK_MS: u64 = 80;
 const REFRESH_SECS: u64 = 30;
 const MAIN_PAGE_JUMP: isize = 10;
 
+/// Minimum column budget the status bar's center status (repo/branch/dirty
+/// info) must keep after the mode badge and the right-hand key hint. Below
+/// this, `fit_hint` steps down to a shorter hint tier instead of letting the
+/// center status get squeezed to nothing.
+const STATUS_CENTER_FLOOR: usize = 20;
+
 /// Concurrency cap for background git operations: `available_parallelism * 4`, min 4.
 /// Matches the Go reference's `runtime.GOMAXPROCS(0) * 4` semaphore.
 fn worker_limit() -> usize {
@@ -862,6 +868,21 @@ struct App {
     event_rx: mpsc::UnboundedReceiver<BgEvent>,
     last_refresh: Instant,
     needs_full_redraw: bool,
+    /// Cached repo-table column widths, keyed by the area width and
+    /// repo/worktree mode they were computed for. `None` forces a recompute.
+    /// Set to `None` whenever repo or worktree data changes.
+    col_widths: Option<ColWidths>,
+}
+
+/// Repo-table column widths, cached across frames (see `App::col_widths`).
+#[derive(Clone, Copy)]
+struct ColWidths {
+    area_width: u16,
+    in_wt: bool,
+    repo_col_w: u16,
+    branch_col_w: u16,
+    age_col_w: u16,
+    show_age: bool,
 }
 
 impl App {
@@ -896,6 +917,7 @@ impl App {
             event_rx: rx,
             last_refresh: Instant::now(),
             needs_full_redraw: false,
+            col_widths: None,
         }
     }
 
@@ -1425,6 +1447,12 @@ impl App {
     }
 
     fn apply_bg_event(&mut self, event: BgEvent) {
+        // Every branch below mutates a repo's snapshot, its worktree rows, or
+        // both — any of which can change the longest name/branch/age string
+        // the repo table sizes its columns to. Invalidate unconditionally
+        // rather than tracking each branch's effect individually; recompute
+        // is cheap and only actually runs on the next draw.
+        self.col_widths = None;
         match event {
             BgEvent::RepoLoaded(snapshot) => {
                 self.repos.push(RepoView::new(snapshot));
@@ -2866,43 +2894,14 @@ fn repo_row_visual(
     (style, repo_cell, msg_text)
 }
 
-fn draw_repo_table(frame: &mut Frame, app: &mut App, area: Rect) {
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let viewport_h = area.height.saturating_sub(2) as usize;
-    let in_wt = app.worktree_mode;
-
-    // ── update scroll offset ──────────────────────────────────────────────
-    let (cursor, total) = if in_wt {
-        (app.wt_cursor, app.wt_rows.len())
-    } else {
-        (app.cursor, app.repos.len())
-    };
-    if total > 0 {
-        if in_wt {
-            if cursor < app.wt_offset {
-                app.wt_offset = cursor;
-            } else if viewport_h > 0 && cursor >= app.wt_offset + viewport_h {
-                app.wt_offset = cursor + 1 - viewport_h;
-            }
-            app.wt_offset = app.wt_offset.min(total.saturating_sub(viewport_h));
-        } else {
-            if cursor < app.table_offset {
-                app.table_offset = cursor;
-            } else if viewport_h > 0 && cursor >= app.table_offset + viewport_h {
-                app.table_offset = cursor + 1 - viewport_h;
-            }
-            app.table_offset = app.table_offset.min(total.saturating_sub(viewport_h));
-        }
-    }
-    let visible_start = if in_wt {
-        app.wt_offset
-    } else {
-        app.table_offset
-    };
-    let visible_end = (visible_start + viewport_h).min(total);
-
+/// Recompute repo-table column widths from current repo/worktree data — an
+/// O(n) scan that formats every branch's ahead/behind counts and every
+/// repo's last-modified age. Called only when `App::col_widths` is
+/// invalidated or the terminal width/mode changed (see `draw_repo_table`),
+/// not on every frame.
+fn compute_col_widths(app: &App, area_width: u16, inner_w: usize, in_wt: bool) -> ColWidths {
     // ── age column (normal mode, terminal ≥ 112 columns) ─────────────────
-    let show_age = !in_wt && area.width >= 112;
+    let show_age = !in_wt && area_width >= 112;
     let age_col_w: u16 = if show_age {
         let max_len = app
             .repos
@@ -2939,6 +2938,9 @@ fn draw_repo_table(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     .clamp(8, 36) as u16;
 
+    // Digit count without allocating (unlike `n.to_string().len()`).
+    let digits = |n: u32| n.checked_ilog10().unwrap_or(0) as usize + 1;
+
     let max_branch = if in_wt {
         app.wt_rows
             .iter()
@@ -2952,10 +2954,10 @@ fn draw_repo_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 let b = &r.snapshot.branch;
                 let mut len = b.name.chars().count();
                 if b.ahead > 0 {
-                    len += 1 + 1 + b.ahead.to_string().len();
+                    len += 1 + 1 + digits(b.ahead);
                 }
                 if b.behind > 0 {
-                    len += 1 + 1 + b.behind.to_string().len();
+                    len += 1 + 1 + digits(b.behind);
                 }
                 len
             })
@@ -2966,6 +2968,73 @@ fn draw_repo_table(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let repo_col_w = (max_name + 4).min(inner_w as u16 / 3);
     let branch_col_w = (max_branch + 1).min(inner_w as u16 / 4);
+
+    ColWidths {
+        area_width,
+        in_wt,
+        repo_col_w,
+        branch_col_w,
+        age_col_w,
+        show_age,
+    }
+}
+
+fn draw_repo_table(frame: &mut Frame, app: &mut App, area: Rect) {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let in_wt = app.worktree_mode;
+
+    // Reuse cached column widths unless the cache was invalidated by new
+    // repo/worktree data (see `apply_bg_event`) or the width/mode changed —
+    // recomputing is an O(n) scan and `draw` runs on every 80ms tick.
+    if app
+        .col_widths
+        .is_none_or(|c| c.area_width != area.width || c.in_wt != in_wt)
+    {
+        app.col_widths = Some(compute_col_widths(app, area.width, inner_w, in_wt));
+    }
+    let ColWidths {
+        repo_col_w,
+        branch_col_w,
+        age_col_w,
+        show_age,
+        ..
+    } = app.col_widths.expect("populated above");
+
+    // A header row costs one more line than the borders alone; skip it on
+    // very short terminals so every row still goes to data.
+    let show_header = area.height >= 10;
+    let viewport_h = area.height.saturating_sub(if show_header { 3 } else { 2 }) as usize;
+
+    // ── update scroll offset ──────────────────────────────────────────────
+    let (cursor, total) = if in_wt {
+        (app.wt_cursor, app.wt_rows.len())
+    } else {
+        (app.cursor, app.repos.len())
+    };
+    if total > 0 {
+        if in_wt {
+            if cursor < app.wt_offset {
+                app.wt_offset = cursor;
+            } else if viewport_h > 0 && cursor >= app.wt_offset + viewport_h {
+                app.wt_offset = cursor + 1 - viewport_h;
+            }
+            app.wt_offset = app.wt_offset.min(total.saturating_sub(viewport_h));
+        } else {
+            if cursor < app.table_offset {
+                app.table_offset = cursor;
+            } else if viewport_h > 0 && cursor >= app.table_offset + viewport_h {
+                app.table_offset = cursor + 1 - viewport_h;
+            }
+            app.table_offset = app.table_offset.min(total.saturating_sub(viewport_h));
+        }
+    }
+    let visible_start = if in_wt {
+        app.wt_offset
+    } else {
+        app.table_offset
+    };
+    let visible_end = (visible_start + viewport_h).min(total);
+
     let msg_col_w = (inner_w as u16)
         .saturating_sub(repo_col_w + branch_col_w + age_col_w)
         .max(8) as usize;
@@ -3049,10 +3118,38 @@ fn draw_repo_table(frame: &mut Frame, app: &mut App, area: Rect) {
         block = block.title_bottom(Line::from(Span::styled(" more below ", dim)).centered());
     }
 
-    let table = Table::new(rows, widths)
+    let mut table = Table::new(rows, widths)
         .block(block)
         .row_highlight_style(Style::default());
+    if show_header {
+        let mut header_cells = vec![
+            // The repo cell is "<cursor> <icon> <name>" (see `repo_row_visual`) —
+            // a 4-char prefix before the name starts. Indent the label to match.
+            Cell::from("    repo"),
+            Cell::from(if in_wt { "worktree" } else { "branch" }),
+            Cell::from("message"),
+        ];
+        if show_age {
+            header_cells.push(Cell::from("age"));
+        }
+        table = table.header(Row::new(header_cells).style(dim));
+    }
     frame.render_widget(table, area);
+}
+
+/// Pick the widest of `tiers` (ordered full → short → minimal) whose width
+/// still leaves the status bar's center status at least `STATUS_CENTER_FLOOR`
+/// columns, given the total bar width and the mode badge's width. Falls back
+/// to the last (shortest) tier if none fit — the caller then simply gets a
+/// squeezed or empty center rather than a hint clipped mid-word.
+fn fit_hint(tiers: [&str; 3], total_w: usize, mode_w: usize) -> &str {
+    for tier in tiers {
+        let right_w = tier.chars().count();
+        if total_w.saturating_sub(mode_w + right_w) >= STATUS_CENTER_FLOOR {
+            return tier;
+        }
+    }
+    tiers[tiers.len() - 1]
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -3108,27 +3205,77 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         " no repositories".into()
     };
 
+    let total_w = area.width as usize;
     let right: &str = if app.worktree_mode {
-        "  n:new  d:rm  L:lock  X:prune  W:exit "
+        fit_hint(
+            [
+                "  n:new  d:rm  L:lock  X:prune  W:exit ",
+                "  n/d/L/X  W:exit ",
+                "  ?:help ",
+            ],
+            total_w,
+            mode_w,
+        )
     } else if let Some(panel) = &app.panel {
         match panel.kind {
-            PanelKind::Branches => "  j/k:nav  space:checkout  n:new  d/D:del  Esc:close ",
-            _ => "  j/k:scroll  Esc:close ",
+            PanelKind::Branches => fit_hint(
+                [
+                    "  j/k:nav  space:checkout  n:new  d/D:del  Esc:close ",
+                    "  j/k  space:co  d/D  Esc ",
+                    "  ?:help ",
+                ],
+                total_w,
+                mode_w,
+            ),
+            _ => fit_hint(
+                ["  j/k:scroll  Esc:close ", "  j/k  Esc ", "  ?:help "],
+                total_w,
+                mode_w,
+            ),
         }
     } else if let Some(repo) = app.repos.get(app.cursor) {
         match &repo.state {
-            RepoOpState::Success(_) | RepoOpState::Fail { .. } => "  c/Esc:clear ",
-            RepoOpState::Working => "  working… ",
-            _ if repo.snapshot.dirty => "  c:commit  S:stash  TAB:lazygit ",
-            _ if repo.snapshot.branch.behind > 0 => "  p:pull  f:fetch  TAB:lazygit ",
-            _ if repo.snapshot.branch.ahead > 0 => "  P:push  TAB:lazygit ",
-            _ => "  m:mode  TAB:lazygit ",
+            RepoOpState::Success(_) | RepoOpState::Fail { .. } => {
+                fit_hint(["  c/Esc:clear ", "  c/Esc ", "  ?:help "], total_w, mode_w)
+            }
+            RepoOpState::Working => fit_hint(
+                ["  working… ", "  working… ", "  working… "],
+                total_w,
+                mode_w,
+            ),
+            _ if repo.snapshot.dirty => fit_hint(
+                [
+                    "  c:commit  S:stash  TAB:lazygit ",
+                    "  c  S  TAB ",
+                    "  ?:help ",
+                ],
+                total_w,
+                mode_w,
+            ),
+            _ if repo.snapshot.branch.behind > 0 => fit_hint(
+                [
+                    "  p:pull  f:fetch  TAB:lazygit ",
+                    "  p  f  TAB ",
+                    "  ?:help ",
+                ],
+                total_w,
+                mode_w,
+            ),
+            _ if repo.snapshot.branch.ahead > 0 => fit_hint(
+                ["  P:push  TAB:lazygit ", "  P  TAB ", "  ?:help "],
+                total_w,
+                mode_w,
+            ),
+            _ => fit_hint(
+                ["  m:mode  TAB:lazygit ", "  m  TAB ", "  ?:help "],
+                total_w,
+                mode_w,
+            ),
         }
     } else {
-        "  m:mode "
+        fit_hint(["  m:mode ", "  m:mode ", "  ?:help "], total_w, mode_w)
     };
     let right_w = right.chars().count();
-    let total_w = area.width as usize;
     let center_w = total_w.saturating_sub(mode_w + right_w);
     let center_trimmed = truncate(&center, center_w.saturating_sub(1));
     let pad = center_w.saturating_sub(center_trimmed.chars().count() + 1);
