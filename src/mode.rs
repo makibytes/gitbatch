@@ -14,16 +14,6 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub const fn quick_mode(self) -> Option<Self> {
-        match self {
-            Self::Fetch => Some(Self::Fetch),
-            Self::Pull => Some(Self::Pull),
-            Self::Merge => Some(Self::Merge),
-            Self::Rebase => Some(Self::Rebase),
-            Self::Push => Some(Self::Push),
-        }
-    }
-
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Fetch => "fetch",

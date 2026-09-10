@@ -22,10 +22,10 @@ pub enum AppError {
     },
     #[error("no git repositories found in the selected directories")]
     NoRepositoriesFound,
+    #[error("auto-stash was not restored: {reason}")]
+    AutoStashNotRestored { reason: String },
     #[error("path does not look like a git repository: {0}")]
     NotRepository(PathBuf),
-    #[error("unsupported quick mode: {0}")]
-    UnsupportedQuickMode(String),
     #[error("batch completed with failures: {failed}/{total}")]
     BatchFailures { failed: usize, total: usize },
 }
@@ -43,9 +43,14 @@ impl AppError {
             || lower.contains("invalid username or password")
             || lower.contains("http basic: access denied")
             || lower.contains("fatal: authentication failed for")
-            || lower.contains("permission denied")
+            // Narrowed from a bare "permission denied": that phrase alone
+            // also covers a plain filesystem permission error (e.g. a repo
+            // directory unreadable by the current user), which isn't
+            // something a credentials prompt can fix.
+            || lower.contains("permission denied (publickey")
             || lower.contains("401 unauthorized")
             || lower.contains("403 forbidden")
+            || lower.contains("returned error: 403")
     }
 
     pub fn suggests_force_push(&self) -> bool {
@@ -60,10 +65,10 @@ impl AppError {
 
     pub fn is_merge_conflict(&self) -> bool {
         let lower = self.to_string().to_lowercase();
-        lower.contains("conflict")
-            || lower.contains("merge conflict")
-            || lower.contains("automatic merge failed")
-            || lower.contains("CONFLICT")
+        // `lower` is already lowercased, so a bare "conflict" already
+        // subsumes both "merge conflict" and any-case "CONFLICT" — those
+        // two extra checks were unreachable.
+        lower.contains("conflict") || lower.contains("automatic merge failed")
     }
 
     pub fn is_rebase_conflict(&self) -> bool {
@@ -107,5 +112,38 @@ mod tests {
         };
         assert!(error.suggests_force_push());
         assert!(!error.requires_credentials());
+    }
+
+    #[test]
+    fn plain_filesystem_permission_error_does_not_request_credentials() {
+        let error = AppError::GitCommandFailed {
+            command: "git status".into(),
+            code: Some(128),
+            output: "fatal: cannot open '.git/index': Permission denied".into(),
+        };
+        assert!(
+            !error.requires_credentials(),
+            "a filesystem permission error isn't something a credentials prompt can fix"
+        );
+    }
+
+    #[test]
+    fn ssh_publickey_permission_denied_requests_credentials() {
+        let error = AppError::GitCommandFailed {
+            command: "git fetch".into(),
+            code: Some(128),
+            output: "git@github.com: Permission denied (publickey).".into(),
+        };
+        assert!(error.requires_credentials());
+    }
+
+    #[test]
+    fn merge_conflict_detected_case_insensitively() {
+        let error = AppError::GitCommandFailed {
+            command: "git merge".into(),
+            code: Some(1),
+            output: "CONFLICT (content): Merge conflict in f.txt".into(),
+        };
+        assert!(error.is_merge_conflict());
     }
 }

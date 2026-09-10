@@ -32,7 +32,7 @@ From source (for developers and advanced users):
 1. install a recent version of Rust 
 2. run `cargo install --path .`
 
-gitbatch requires a `git` binary on `PATH`. The optional `Tab` handoff needs [lazygit](https://github.com/jesseduffield/lazygit) installed.
+gitbatch requires a `git` binary on `PATH` — version 2.30 or newer (for `--force-if-includes`, used by force-push). The optional `Tab` handoff needs [lazygit](https://github.com/jesseduffield/lazygit) installed.
 
 ## Use
 
@@ -55,13 +55,13 @@ Quick mode exits with a non-zero status if at least one repository operation fai
 
 | Key | Action |
 | --- | --- |
-| `j` / `k`, arrows | Move selection |
+| `j` / `k`, arrows | Move cursor |
 | `PgUp` / `PgDn` | Jump by 10 rows |
 | `g` / `G` | Jump to top / bottom |
 | `←` / `→` | Scroll message column |
-| `Space` | Queue / unqueue repository |
-| `Enter` | Run queued repositories, or run on current repo if nothing is queued |
-| `a` / `A` | Queue all / clear queue **and** all result markers |
+| `Space` | Select / deselect repository |
+| `Enter` | Run on the selection, or on the current repo if nothing is selected |
+| `a` / `A` | Select all / clear selection **and** all result markers |
 | `m` | Cycle mode: `Pull → Merge → Rebase → Push → Pull` |
 | `f` | Fetch current repository |
 | `p` | Pull current repository (fast-forward) |
@@ -76,12 +76,12 @@ Quick mode exits with a non-zero status if at least one repository operation fai
 | `S` / `O` / `D` | Stash push / pop / drop (drop asks for confirmation) |
 | `W` | Toggle worktree mode |
 | `d` / `L` / `X` | Remove worktree / lock-unlock worktree / prune worktrees (in worktree mode) |
-| `t` | Toggle sorting by name / modification time |
+| `t` | Toggle sorting by name / last commit time |
 | `Tab` | Open lazygit for the selected repository |
 | `?` | Toggle help |
 | `q` / `Ctrl+C` | Quit (`q` closes an open panel first) |
 
-Inside the branches panel: `Space`/`c` checkout, `n` new branch, `d` delete, `D` force-delete. The panel lists local branches followed by remote branches; remote branches that are already tracked by a local branch are hidden (the tracking info on the local line covers them). Checking out a remote branch creates a local tracking branch; `d` on a remote branch deletes it on the remote. When several repos are tagged, panels show the branches common to all of them and every action fans out over the whole selection — destructive ones after a confirmation dialog.
+Inside the branches panel: `Space`/`c` checkout, `n` new branch, `d` delete, `D` force-delete. The panel lists local branches followed by remote branches; remote branches that are already tracked by a local branch are hidden (the tracking info on the local line covers them). Checking out a remote branch creates a local tracking branch; `d` on a remote branch deletes it on the remote. When several repos are selected, panels show the branches common to all of them and every action fans out over the whole selection — destructive ones after a confirmation dialog.
 
 ### Mode cycle
 
@@ -92,7 +92,7 @@ The `m` key cycles through git operations:
 3. **Rebase** — `git pull --rebase` — rebase local commits on upstream (linear history)
 4. **Push** — `git push` — push local commits to remote (with a confirmation dialog for `--force` if rejected). If the branch has no upstream yet, gitbatch pushes with `-u` so the remote branch is created and tracking is set — create a branch locally and simply push to publish it.
 
-Fetch is not part of the cycle: gitbatch fetches all repositories automatically at startup. Use `f` for an on-demand fetch of the current/tagged repos, or `-q -m fetch` for a headless fetch.
+Fetch is not part of the cycle: gitbatch fetches all repositories automatically at startup. Use `f` for an on-demand fetch of the current/selected repos, or `-q -m fetch` for a headless fetch.
 
 ### Worktree mode
 
@@ -147,11 +147,15 @@ When `git pull` or `git merge` results in conflicts:
 
 ### Force-push safety
 
-When a push is rejected as non-fast-forward, a force-push confirmation dialog opens automatically. Confirm with `y` / `Enter`, or cancel with `n` / `Esc`. Use this **only when intentional** — force-push overwrites remote history.
+When a push is rejected as non-fast-forward, a force-push confirmation dialog opens automatically. Confirm with `y` / `Enter`, or cancel with `n` / `Esc`. Use this **only when intentional** — force-push overwrites remote history. The retry uses `--force-with-lease --force-if-includes`, so it still refuses if the remote moved again after your last fetch — even gitbatch's own background fetch — rather than overwriting an unseen commit.
+
+### Batch confirmation
+
+`P` (push) over more than one selected repo opens a confirmation naming the repo count first (e.g. "Push to 12 remotes") — a multi-repo push, the one operation that changes what's on the remote, never fires without you seeing its scope. `Enter`, `p`, and `f` fan out immediately regardless of selection size: fetch/pull/merge/rebase only read from the remote and write locally, so a bad result is a local, cheaply-reverted mistake, not something that touches the remote.
 
 ### Reset operations
 
-Press `U` to reset the current (or all tagged) repositories to upstream:
+Press `U` to reset the current (or all selected) repositories to upstream:
 
 - `y` / `Enter` — `git reset --mixed @{upstream}` — keep changes, unstage commits
 - `H` — `git reset --hard @{upstream}` — discard all local changes and commits
@@ -163,11 +167,12 @@ Repos without an upstream are skipped automatically.
 With `auto_stash: true` in the config, pull/merge/rebase on a dirty repository automatically runs `git stash push --include-untracked` first and `git stash pop` afterwards:
 
 - on success the result message ends with `auto-stash restored`
-- if the pop conflicts, the stash entry (`gitbatch auto-stash`) is kept and the message says so — resolve manually, the stash badge `{N}` marks the repo
-- if the operation itself fails, the stash is popped back immediately
+- if the pop conflicts, or if the stash stack changed underneath the operation (e.g. you stashed something else manually while it was running), the stash entry (`gitbatch auto-stash`) is kept rather than risk popping the wrong one — the message says so, resolve manually; the stash badge `{N}` marks the repo
+- if the operation itself fails, the stash is restored the same way
+- a clean tree never creates a stash entry in the first place, so a stale "dirty" reading can never pop a stash you made yourself
 - untracked files are stashed too, so pull/rebase/merge can proceed on trees with new files
 
-Note: the `a` (queue-all) safety gating is unchanged — repos whose incoming changes overlap the dirty tree still aren't auto-queued; auto-stash applies when you run the operation.
+Note: `a` (select-all) has its own, more conservative safety gating — a repo with incoming changes that overlap the dirty tree still isn't auto-selected; auto-stash only comes into play once you run the operation.
 
 ### Cherry-pick & tag management
 
@@ -180,20 +185,20 @@ Not built into gitbatch — press `Tab` to handle cherry-picks and tags interact
 **Daily sync (safe default)**
 
 1. Start `gitbatch -d ~/projects -r 2`
-2. gitbatch fetches every repo automatically at startup; repos that can fast-forward cleanly are pre-tagged (`●`) for you
-3. Mode is "Pull (FF)" by default — press `Enter` → pulls all tagged repos
+2. gitbatch fetches every repo automatically at startup; repos that can fast-forward cleanly are pre-selected (`●`) for you
+3. Mode is "Pull (FF)" by default — press `Enter` and it pulls every selected repo immediately
 4. Verify results: green `✓`, amber `⚠` for conflicts, red `✗` for FF failures
-5. Press `m` → "Merge" or "Rebase" for diverged branches, re-queue with `Space`/`a` and retry
+5. Press `m` → "Merge" or "Rebase" for diverged branches, reselect with `Space`/`a` and retry
 
 **Feature branch cleanup**: press `W` for worktree mode, `X` to prune dead worktrees, `L` to lock/unlock, then commit and `P` to push.
 
-**Staged release**: tag only your staging repos with `Space`, switch to "Push" mode, `Enter`, verify results are clean — then repeat for the production repos. Test with a subset first; the best batch operation is one you can undo.
+**Staged release**: select only your staging repos with `Space`, switch to "Push" mode, `Enter`, verify results are clean — then repeat for the production repos. Test with a subset first; the best batch operation is one you can undo.
 
-**Batch branch management**: tag repos with `Space`, press `b` — the panel shows the branches **common** to all tagged repos. `n` creates and checks out the same branch everywhere; later `d` on that branch deletes it everywhere (destructive variants always ask for confirmation first).
+**Batch branch management**: select repos with `Space`, press `b` — the panel shows the branches **common** to all selected repos. `n` creates and checks out the same branch everywhere; later `d` on that branch deletes it everywhere (destructive variants always ask for confirmation first).
 
 ### Error recovery
 
-- **Red ✗** (e.g. `no tracking information`): press `u` to set an upstream directly (accepts `origin` or `origin/branch`, works across all tagged repos), or `Tab` for lazygit diagnosis
+- **Red ✗** (e.g. `no tracking information`): press `u` to set an upstream directly (accepts `origin` or `origin/branch`, works across all selected repos), or `Tab` for lazygit diagnosis
 - **Gray ✗** (network): check connectivity, then `f` to retry the fetch
 - **Amber ⚠** (conflicts): `Tab` → resolve in lazygit → `git merge --continue` / `git rebase --continue` → back in gitbatch press `Enter` to retry
 - **`?`** (auth): the credentials prompt opens automatically and retries; if it fails again, check SSH keys or token permissions
@@ -205,7 +210,7 @@ Not built into gitbatch — press `Tab` to handle cherry-picks and tags interact
 | Icon | Meaning |
 |------|---------|
 | ` ` (space) | Idle |
-| `●` | Queued — will run on Enter |
+| `●` | Selected — will run on Enter |
 | `⠋` | Working |
 | `✓` | Success |
 | `✗` | Failed (gray = network problem) |
@@ -223,12 +228,12 @@ Not built into gitbatch — press `Tab` to handle cherry-picks and tags interact
 
 ### Pro tips
 
-- `t` toggles sorting between name and modification time — use modified sort to find stale repos
+- `t` toggles sorting between name and last commit time — use commit-time sort to find stale repos
 - `←` / `→` scroll the message column to read long error messages
-- `a` then a glance at the `●` count is a quick sanity check before a mass operation; `A` clears the queue and all result markers in one stroke
+- `a` then a glance at the `●` count is a quick sanity check before a mass operation; `A` clears the selection and all result markers in one stroke
 - `v` opens the commit log panel — check what you're about to push before switching to push mode
 - Stash workflow: `S` stash → pull → `O` pop — or set `auto_stash: true` and let gitbatch do exactly this around every pull/merge/rebase
-- Queue first, review, then press `Enter` — don't run blindly, and verify before force-pushes, hard resets, and batch deletes
+- Select first, review, then press `Enter` — don't run blindly, and verify before force-pushes, hard resets, and batch deletes
 
 ### Debugging
 

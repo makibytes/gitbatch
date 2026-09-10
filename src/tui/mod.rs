@@ -23,13 +23,30 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table},
 };
 use tokio::sync::mpsc;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     Result,
     config::AppConfig,
-    git::{Credentials, GitRunner, RemoteAction, RepositorySnapshot},
+    git::{Credentials, GitRunner, RemoteAction, RepositorySnapshot, worker_limit},
     mode::Mode,
 };
+
+mod text;
+use text::{
+    filter_tracked_remotes, next_char_boundary, parse_branch_name, parse_branch_names,
+    prev_char_boundary, remote_short_ref, validate_branch_name, word_back_start,
+};
+
+mod worktree;
+use worktree::{
+    WorktreeOp, WtDisplayRow, default_worktree_path, parse_worktree_listing, run_worktree_op,
+};
+
+mod draw;
+use draw::{display_action, draw};
+
+mod keys;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -44,14 +61,6 @@ const MAIN_PAGE_JUMP: isize = 10;
 /// this, `fit_hint` steps down to a shorter hint tier instead of letting the
 /// center status get squeezed to nothing.
 const STATUS_CENTER_FLOOR: usize = 20;
-
-/// Concurrency cap for background git operations: `available_parallelism * 4`, min 4.
-/// Matches the Go reference's `runtime.GOMAXPROCS(0) * 4` semaphore.
-fn worker_limit() -> usize {
-    std::thread::available_parallelism()
-        .map_or(4, |n| n.get().saturating_mul(4))
-        .max(4)
-}
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 const ICON_QUEUED: &str = "●";
@@ -118,6 +127,7 @@ const C_AHEAD_FG: Color = Color::Rgb(102, 217, 131); // vibrant green — commit
 const C_BEHIND_FG: Color = Color::Rgb(255, 183, 77); // amber — commits to pull
 const C_AGE_FG: Color = Color::Rgb(95, 95, 115); // muted — relative age column
 const C_STASH_FG: Color = Color::Rgb(150, 100, 200); // muted purple — stash count badge
+const C_NOTICE_FG: Color = Color::Rgb(179, 157, 219); // lavender — transient status-bar notice
 
 // ── Local (non-remote) action types ──────────────────────────────────────────
 
@@ -157,6 +167,62 @@ impl LocalAction {
     }
 }
 
+/// Fetch the content for a `b`/`s`/`v` panel. With more than one path in
+/// `targets` and `kind == Branches`, shows only the branches common to every
+/// target (queried concurrently — a serial loop would stall the UI for the
+/// sum of the git round-trips); otherwise shows `current`'s own content.
+async fn load_panel_content(
+    runner: &GitRunner,
+    kind: PanelKind,
+    current: &Path,
+    targets: &[PathBuf],
+) -> Result<PanelState> {
+    if kind == PanelKind::Branches && targets.len() > 1 {
+        let n = targets.len();
+        let runner = runner.clone();
+        let outputs = future::try_join_all(targets.iter().map(|p| {
+            let runner = runner.clone();
+            async move { runner.branch_list(p).await }
+        }))
+        .await?;
+        let name_sets: Vec<HashSet<String>> = outputs
+            .iter()
+            .map(|o| parse_branch_names(&filter_tracked_remotes(o)))
+            .collect();
+
+        // Intersect all sets.
+        let common = if let Some(first) = name_sets.first() {
+            let mut acc = first.clone();
+            for s in &name_sets[1..] {
+                acc.retain(|name| s.contains(name));
+            }
+            acc
+        } else {
+            HashSet::new()
+        };
+
+        let mut names: Vec<&str> = common.iter().map(String::as_str).collect();
+        names.sort_unstable();
+
+        let title = format!("Branches ({n} repos)");
+        let content = names.join("\n");
+        return Ok(PanelState::new_navigable(kind, title, content));
+    }
+
+    let (title, content) = match kind {
+        PanelKind::Branches => (
+            "Branches".into(),
+            filter_tracked_remotes(&runner.branch_list(current).await?),
+        ),
+        PanelKind::Commits => ("Commits".into(), runner.commit_log(current).await?),
+        PanelKind::Status => ("Status".into(), runner.status_text(current).await?),
+    };
+    Ok(match kind {
+        PanelKind::Branches => PanelState::new_navigable(kind, title, content),
+        _ => PanelState::new_text(kind, title, content),
+    })
+}
+
 // ── Background event types ────────────────────────────────────────────────────
 
 enum BgEvent {
@@ -189,189 +255,43 @@ enum BgEvent {
     /// Results of a background fast-forward dry-run check triggered after a
     /// fetch (manual or periodic) increased a repo's `behind` count.
     PullSafetyChecked(Vec<(PathBuf, bool)>),
-}
-
-// ── Worktree display rows ─────────────────────────────────────────────────────
-
-struct WtDisplayRow {
-    path: PathBuf,
-    display_name: String,
-    wt_label: String,
-    repo_idx: usize,
-}
-
-struct WtEntry {
-    path: PathBuf,
-    is_primary: bool,
-}
-
-fn parse_worktree_listing(text: &str) -> Vec<WtEntry> {
-    let mut entries: Vec<WtEntry> = Vec::new();
-    let mut current_path: Option<PathBuf> = None;
-
-    for line in text.lines() {
-        if let Some(path_str) = line.strip_prefix("worktree ") {
-            if let Some(path) = current_path.take() {
-                let is_primary = entries.is_empty();
-                entries.push(WtEntry { path, is_primary });
-            }
-            current_path = Some(PathBuf::from(path_str));
-        }
-    }
-    if let Some(path) = current_path {
-        let is_primary = entries.is_empty();
-        entries.push(WtEntry { path, is_primary });
-    }
-    entries
-}
-
-// ── Branch-name parsing ──────────────────────────────────────────────────────
-
-/// Extract the branch name from one line of `git branch --all -vv` output.
-/// Strips leading markers (`*`, `+`, spaces) and returns the first
-/// whitespace-delimited token (the ref name). Returns `None` for header /
-/// arrow lines (e.g. `remotes/origin/HEAD -> origin/main`).
-fn parse_branch_name(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start_matches(['*', '+', ' ']);
-    let name = trimmed.split_whitespace().next()?;
-    // Skip symbolic refs like `remotes/origin/HEAD`
-    if trimmed.contains(" -> ") {
-        return None;
-    }
-    Some(name)
-}
-
-/// Collect the set of branch names from `git branch [-r] -vv` output.
-fn parse_branch_names(output: &str) -> HashSet<String> {
-    output
-        .lines()
-        .filter_map(parse_branch_name)
-        .map(ToString::to_string)
-        .collect()
-}
-
-/// For a `git branch --all` row naming a remote-tracking branch
-/// (`remotes/origin/x`), return the `origin/x` form used by the remote flows.
-fn remote_short_ref(name: &str) -> Option<&str> {
-    name.strip_prefix("remotes/")
-}
-
-/// From one local-branch line of `git branch --all -vv --no-abbrev` output,
-/// extract the upstream short ref (`origin/x`) out of the tracking bracket
-/// that follows the SHA, e.g. `[origin/x]` or `[origin/x: ahead 1]`.
-fn upstream_of_local_line(line: &str) -> Option<&str> {
-    let name = parse_branch_name(line)?;
-    if name.starts_with("remotes/") {
-        return None;
-    }
-    // Tokens: name, 40-char SHA, then optionally `[upstream...`.
-    let mut tokens = line.trim_start_matches(['*', '+', ' ']).split_whitespace();
-    tokens.next()?; // name
-    let sha = tokens.next()?;
-    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let bracket = tokens.next()?.strip_prefix('[')?;
-    Some(bracket.trim_end_matches([']', ':']))
-}
-
-/// Drop `remotes/origin/x` rows from `git branch --all -vv` output when a
-/// local branch in the same output already tracks `origin/x` — the tracking
-/// info shown on the local line makes the remote row redundant.
-fn filter_tracked_remotes(output: &str) -> String {
-    let tracked: HashSet<&str> = output.lines().filter_map(upstream_of_local_line).collect();
-    output
-        .lines()
-        .filter(|line| {
-            parse_branch_name(line)
-                .and_then(remote_short_ref)
-                .is_none_or(|short| !tracked.contains(short))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-// ── Prompt editing helpers ────────────────────────────────────────────────────
-
-/// Byte offset of the char boundary before `idx` (0 if already at the start).
-fn prev_char_boundary(s: &str, idx: usize) -> usize {
-    s[..idx]
-        .chars()
-        .next_back()
-        .map_or(0, |c| idx - c.len_utf8())
-}
-
-/// Byte offset of the char boundary after `idx` (unchanged if at the end).
-fn next_char_boundary(s: &str, idx: usize) -> usize {
-    s[idx..].chars().next().map_or(idx, |c| idx + c.len_utf8())
-}
-
-/// Start of the "word" preceding `cursor`: skips separators backwards, then
-/// the run of non-separator chars — so `feat/my-branch` deletes one segment
-/// at a time.
-fn word_back_start(s: &str, cursor: usize) -> usize {
-    let is_sep = |c: char| matches!(c, '/' | '-' | '_' | '.' | ' ');
-    let char_at = |idx: usize| s[idx..].chars().next();
-    let mut idx = cursor;
-    loop {
-        let prev = prev_char_boundary(s, idx);
-        if prev == idx || !char_at(prev).is_some_and(is_sep) {
-            break;
-        }
-        idx = prev;
-    }
-    loop {
-        let prev = prev_char_boundary(s, idx);
-        if prev == idx || char_at(prev).is_some_and(is_sep) {
-            break;
-        }
-        idx = prev;
-    }
-    idx
-}
-
-/// Approximate `git check-ref-format --branch`: catch obviously invalid names
-/// before handing them to git.
-fn validate_branch_name(name: &str) -> std::result::Result<(), &'static str> {
-    if name.is_empty() {
-        return Err("branch name is empty");
-    }
-    if name == "@" {
-        return Err("'@' is not a valid branch name");
-    }
-    if name.starts_with('-') {
-        return Err("branch name must not start with '-'");
-    }
-    if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
-        return Err("invalid '/' placement in branch name");
-    }
-    if name.ends_with('.') || name.contains("..") {
-        return Err("invalid '.' placement in branch name");
-    }
-    if name.contains("@{") {
-        return Err("branch name must not contain '@{'");
-    }
-    if name
-        .split('/')
-        .any(|seg| seg.starts_with('.') || seg.ends_with(".lock"))
-    {
-        return Err("segment must not start with '.' or end with '.lock'");
-    }
-    if name.chars().any(|c| {
-        c.is_whitespace() || c.is_control() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
-    }) {
-        return Err("branch name contains invalid characters");
-    }
-    Ok(())
+    /// Result of a background worktree action (see `run_worktree_op`).
+    WorktreeOpResult {
+        /// The primary repo whose `RepoView` should receive the result —
+        /// not necessarily the worktree acted on: a linked (non-primary)
+        /// worktree has no `RepoView` of its own.
+        repo_path: PathBuf,
+        label: &'static str,
+        result: crate::Result<String>,
+    },
+    /// Content fetched for a panel (`b`/`s`/`v`), or its refresh.
+    PanelReady {
+        kind: PanelKind,
+        result: crate::Result<PanelState>,
+    },
 }
 
 // ── Per-repo operation state ──────────────────────────────────────────────────
+
+/// Where a `Queued` selection came from.
+///
+/// Distinguishing the two is what lets a mode change (`m`) clear the
+/// startup auto-selection — which was computed for the *previous* mode and
+/// must not silently carry over — without discarding a selection the user
+/// built deliberately with `Space`/`a`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueOrigin {
+    /// Pre-selected by the startup fast-forward safety check.
+    Auto,
+    /// Selected by the user, via `Space` or `a` (queue-all).
+    User,
+}
 
 #[derive(Default)]
 enum RepoOpState {
     #[default]
     Idle,
-    Queued,
+    Queued(QueueOrigin),
     Working,
     Success(String),
     Fail {
@@ -408,7 +328,7 @@ impl RepoOpState {
     fn icon(&self, tick: u64) -> &str {
         match self {
             Self::Idle => " ",
-            Self::Queued => ICON_QUEUED,
+            Self::Queued(_) => ICON_QUEUED,
             Self::Working => SPINNER[(tick / 2) as usize % SPINNER.len()],
             Self::Success(_) => ICON_SUCCESS,
             Self::Fail {
@@ -450,7 +370,7 @@ impl RepoOpState {
                     ..
                 } => C_SEL_CONFLICT_BG,
                 Self::Fail { .. } => C_SEL_FAIL_BG,
-                Self::Queued => C_SEL_QUEUED_BG,
+                Self::Queued(_) => C_SEL_QUEUED_BG,
                 Self::Working => C_SEL_WORKING_BG,
                 Self::Idle if no_upstream => C_SEL_NO_UPSTREAM_BG,
                 Self::Idle if has_local => C_SEL_LOCAL_BG,
@@ -477,7 +397,7 @@ impl RepoOpState {
                     ..
                 } => C_NET_FG,
                 Self::Fail { .. } => C_FAIL_FG,
-                Self::Queued => C_QUEUED_FG,
+                Self::Queued(_) => C_QUEUED_FG,
                 Self::Working => C_WORKING_FG,
                 Self::Idle if no_upstream => C_NO_UPSTREAM_FG,
                 Self::Idle if has_local => C_LOCAL_FG,
@@ -551,15 +471,15 @@ impl RepoView {
     }
 
     fn is_queued(&self) -> bool {
-        matches!(self.state, RepoOpState::Queued)
+        matches!(self.state, RepoOpState::Queued(_))
     }
 
     fn toggle_queue(&mut self) {
         self.state = match self.state {
             RepoOpState::Idle | RepoOpState::Success(_) | RepoOpState::Fail { .. } => {
-                RepoOpState::Queued
+                RepoOpState::Queued(QueueOrigin::User)
             }
-            RepoOpState::Queued => RepoOpState::Idle,
+            RepoOpState::Queued(_) => RepoOpState::Idle,
             RepoOpState::Working => return,
         };
     }
@@ -777,6 +697,13 @@ enum ConfirmAction {
     ResetToUpstream {
         paths: Vec<PathBuf>,
     },
+    /// A remote mode (`Enter`, `p`, `P`, `f`) run over more than one repo —
+    /// gated behind a confirmation so a batch scope is never applied to a
+    /// remote outward-facing action without the user seeing the count first.
+    RunMode {
+        mode: Mode,
+        paths: Vec<PathBuf>,
+    },
 }
 
 struct ConfirmPromptState {
@@ -796,8 +723,56 @@ enum SortMode {
     Modified,
 }
 
+/// Why `a` left one or more repositories out of the batch selection.
+///
+/// The fields deliberately describe user-visible eligibility rather than
+/// implementation state, so the status bar can explain a partial selection.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SelectionOutcome {
+    selected: usize,
+    no_upstream: usize,
+    no_updates: usize,
+    /// Skipped due to an active, unresolved merge/rebase conflict. A merely
+    /// *dirty* tree is not skipped for this reason — see `unsafe_pull`.
+    conflicted: usize,
+    /// Skipped because `git pull --ff-only` would fail: either the branches
+    /// diverged, or (on a dirty tree) an incoming path collides with a local
+    /// change. Pull-mode only; Merge/Rebase have no such restriction.
+    unsafe_pull: usize,
+}
+
+impl SelectionOutcome {
+    fn notice(&self) -> String {
+        let mut skipped = Vec::new();
+        if self.no_upstream > 0 {
+            skipped.push(format!("{} no upstream", self.no_upstream));
+        }
+        if self.no_updates > 0 {
+            skipped.push(format!("{} no updates", self.no_updates));
+        }
+        if self.conflicted > 0 {
+            skipped.push(format!("{} conflicted", self.conflicted));
+        }
+        if self.unsafe_pull > 0 {
+            skipped.push(format!("{} not FF-safe", self.unsafe_pull));
+        }
+        if skipped.is_empty() {
+            format!("Selected {}", self.selected)
+        } else {
+            format!("Selected {}; skipped {}", self.selected, skipped.join(", "))
+        }
+    }
+}
+
 /// Run a remote action, optionally wrapped in an auto-stash (the tracked
 /// changes of a dirty tree are stashed first and restored afterwards).
+///
+/// Uses `create_auto_stash`/`restore_auto_stash` rather than raw
+/// `stash push`/`stash pop`: a no-op stash (nothing to save) produces no
+/// guard, so a clean tree can never pop an unrelated, pre-existing stash
+/// entry — and a changed stash stack at restore time (the user stashed
+/// something else while the op was running) is reported instead of silently
+/// popping the wrong entry.
 async fn run_remote_with_autostash(
     runner: &GitRunner,
     path: &Path,
@@ -805,11 +780,23 @@ async fn run_remote_with_autostash(
     creds: Option<&Credentials>,
     stash: bool,
 ) -> Result<String> {
-    if stash {
-        runner
-            .stash_push_include_untracked(path, Some("gitbatch auto-stash"))
-            .await?;
-    }
+    let guard = if stash {
+        runner.create_auto_stash(path).await?
+    } else {
+        None
+    };
+    let Some(guard) = guard else {
+        // Either auto-stash was off, or the tree turned out to have nothing
+        // to stash (stale `dirty` snapshot) — run the action directly.
+        return match creds {
+            Some(c) => {
+                runner
+                    .run_remote_action_with_credentials(path, action, c)
+                    .await
+            }
+            None => runner.run_remote_action(path, action).await,
+        };
+    };
     let result = match creds {
         Some(c) => {
             runner
@@ -818,23 +805,52 @@ async fn run_remote_with_autostash(
         }
         None => runner.run_remote_action(path, action).await,
     };
-    if !stash {
-        return result;
-    }
     match result {
-        Ok(msg) => match runner.stash_pop(path).await {
+        Ok(msg) => match runner.restore_auto_stash(path, guard).await {
             Ok(_) => Ok(format!("{msg}\nauto-stash restored")),
-            Err(_) => Ok(format!(
-                "{msg}\nauto-stash kept (pop failed — resolve manually)"
-            )),
+            Err(e) => Ok(format!("{msg}\nauto-stash kept ({e}) — resolve manually")),
         },
         Err(e) => {
             // Restore the user's tree; if this fails the "gitbatch auto-stash"
-            // entry stays visible in the stash badge.
-            let _ = runner.stash_pop(path).await;
-            Err(e)
+            // entry stays visible in the stash badge, and the failure is
+            // folded into the returned error so it isn't silently dropped.
+            match runner.restore_auto_stash(path, guard).await {
+                Ok(_) => Err(e),
+                Err(restore_err) => Err(crate::error::AppError::Config(format!(
+                    "{e}\n(auto-stash also kept: {restore_err})"
+                ))),
+            }
         }
     }
+}
+
+/// Whether `repo` has an upstream and a commit count relevant to `mode`
+/// (ahead for Push, behind for every pull-like mode). Used both to decide
+/// what `queue_all` may select and, on a mode change, which existing
+/// `User`-origin selections have become moot for the new mode.
+///
+/// Deliberately ignores dirty/conflict state — callers that care (currently
+/// only `queue_all`) check that themselves, since how conservative to be
+/// about it differs by call site.
+fn mode_has_relevant_commits(repo: &RepoView, mode: Mode) -> bool {
+    let b = &repo.snapshot.branch;
+    if b.no_upstream || b.detached {
+        return false;
+    }
+    match mode {
+        Mode::Push => b.ahead > 0,
+        Mode::Pull | Mode::Merge | Mode::Rebase | Mode::Fetch => b.behind > 0,
+    }
+}
+
+/// Whether `mode` updates the remote (pushes refs there), as opposed to only
+/// reading from it and writing locally. Fetch/Pull/Merge/Rebase all fetch
+/// objects from the remote but only ever move local refs/the working tree —
+/// a bad result is a local, cheaply-reverted mistake. Push is the only mode
+/// that changes what's on the remote itself, which is what the multi-repo
+/// confirmation in `App::run_action_on_targets` gates on.
+const fn mode_writes_to_remote(mode: Mode) -> bool {
+    matches!(mode, Mode::Push)
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -852,6 +868,14 @@ struct App {
     help_scroll: usize,
     sort_mode: SortMode,
     panel: Option<PanelState>,
+    /// Kind of panel content currently being fetched in the background, if
+    /// any. Guards `PanelReady` against clobbering a newer view: if the user
+    /// closed the panel or switched to a different kind before an in-flight
+    /// fetch completes, the stale result is dropped instead of applied.
+    pending_panel: Option<PanelKind>,
+    /// Measured visible body height of the active panel. Updated during draw
+    /// so keyboard navigation tracks the actual terminal size.
+    panel_viewport: usize,
     prompt: Option<PromptState>,
     worktree_mode: bool,
     wt_rows: Vec<WtDisplayRow>,
@@ -868,6 +892,8 @@ struct App {
     event_rx: mpsc::UnboundedReceiver<BgEvent>,
     last_refresh: Instant,
     needs_full_redraw: bool,
+    /// Brief non-blocking feedback for selection and mode changes.
+    notice: Option<(String, u64)>,
     /// Cached repo-table column widths, keyed by the area width and
     /// repo/worktree mode they were computed for. `None` forces a recompute.
     /// Set to `None` whenever repo or worktree data changes.
@@ -901,6 +927,8 @@ impl App {
             help_scroll: 0,
             sort_mode: SortMode::Modified,
             panel: None,
+            pending_panel: None,
+            panel_viewport: 1,
             prompt: None,
             worktree_mode: false,
             wt_rows: Vec::new(),
@@ -917,6 +945,7 @@ impl App {
             event_rx: rx,
             last_refresh: Instant::now(),
             needs_full_redraw: false,
+            notice: None,
             col_widths: None,
         }
     }
@@ -993,16 +1022,22 @@ impl App {
     }
 
     fn current_mut(&mut self) -> Option<&mut RepoView> {
-        if self.worktree_mode {
-            let idx = self.wt_rows.get(self.wt_cursor)?.repo_idx;
-            self.repos.get_mut(idx)
-        } else {
-            self.repos.get_mut(self.cursor)
-        }
+        let repo_path = self.current_repo_path()?;
+        self.repo_mut(&repo_path)
     }
 
-    fn panel_kind(&self) -> Option<PanelKind> {
-        self.panel.as_ref().map(|p| p.kind)
+    /// The primary repo that owns the current selection: itself outside
+    /// worktree mode, or the repo a selected worktree row belongs to. A
+    /// linked (non-primary) worktree has no `RepoView` of its own, so this
+    /// is not always the same as `current_path()`.
+    fn current_repo_path(&self) -> Option<PathBuf> {
+        if self.worktree_mode {
+            self.wt_rows
+                .get(self.wt_cursor)
+                .map(|r| r.repo_path.clone())
+        } else {
+            self.current().map(|r| r.snapshot.path.clone())
+        }
     }
 
     fn repo_name_for_path(&self, path: &Path) -> Option<String> {
@@ -1035,43 +1070,138 @@ impl App {
         }
     }
 
-    fn queue_all(&mut self) {
+    fn set_notice(&mut self, message: impl Into<String>) {
+        // At an 80ms tick, 38 ticks is just over three seconds.
+        self.notice = Some((message.into(), self.tick.saturating_add(38)));
+    }
+
+    fn active_notice(&self) -> Option<&str> {
+        self.notice
+            .as_ref()
+            .filter(|(_, until)| self.tick <= *until)
+            .map(|(message, _)| message.as_str())
+    }
+
+    /// Clear an expired notice and report whether it did.
+    ///
+    /// `self.notice` otherwise stays `Some` (just past its `until`) forever
+    /// once set — `active_notice()` alone would keep `is_animating()` seeing
+    /// a *stale* one as gone but never actually own the redraw that erases
+    /// it from the screen, since nothing else changed that tick. Clearing it
+    /// here and reporting `true` for that one tick is what earns it that
+    /// last frame.
+    fn expire_notice(&mut self) -> bool {
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, until)| self.tick > *until)
+        {
+            self.notice = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn selection_scope_label(&self) -> String {
+        match self.queued_count() {
+            0 => "current repo".into(),
+            1 => "1 selected".into(),
+            count => format!("{count} selected"),
+        }
+    }
+
+    /// Switch operation mode.
+    ///
+    /// Clears only the startup auto-selection (computed for the *previous*
+    /// mode — carrying it into a new mode is exactly the defect this fixes:
+    /// a pull preselection must never silently become a push batch). A
+    /// selection the user built deliberately with `Space`/`a` survives; the
+    /// notice instead reports how many of those no longer have anything
+    /// relevant to do in the new mode, so the user can review before `Enter`.
+    fn set_mode(&mut self, mode: Mode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+
+        let mut cleared_auto = 0;
+        for repo in &mut self.repos {
+            if matches!(repo.state, RepoOpState::Queued(QueueOrigin::Auto)) {
+                repo.state = RepoOpState::Idle;
+                cleared_auto += 1;
+            }
+        }
+
+        let user_selected: Vec<&RepoView> = self
+            .repos
+            .iter()
+            .filter(|r| matches!(r.state, RepoOpState::Queued(QueueOrigin::User)))
+            .collect();
+        let ineligible = user_selected
+            .iter()
+            .filter(|r| !mode_has_relevant_commits(r, mode))
+            .count();
+
+        let mut notice = format!("Mode: {}", mode.as_str());
+        if cleared_auto > 0 {
+            let _ = write!(notice, " · cleared {cleared_auto} auto-selected");
+        }
+        if ineligible > 0 {
+            let _ = write!(
+                notice,
+                " · {ineligible} of {} selected have nothing to {}",
+                user_selected.len(),
+                mode.as_str()
+            );
+        }
+        self.set_notice(notice);
+    }
+
+    fn queue_all(&mut self) -> SelectionOutcome {
         let mode = self.mode;
+        let mut outcome = SelectionOutcome::default();
         for repo in &mut self.repos {
             let b = &repo.snapshot.branch;
             // No upstream or detached HEAD: remote ops are impossible.
             if b.no_upstream || b.detached {
+                outcome.no_upstream += 1;
                 continue;
             }
-            match mode {
-                Mode::Push => {
-                    // Push doesn't bring in remote changes, but skip dirty trees to
-                    // avoid confusion (uncommitted work mixed with a push session).
-                    if repo.snapshot.dirty || b.ahead == 0 {
-                        continue;
-                    }
-                }
-                _ => {
-                    // Pull / Merge / Rebase: skip if nothing incoming, or if the
-                    // dry-run (or active unresolved conflict) says pulling would fail.
-                    // A dirty tree the dry-run cleared as conflict-free is fine to queue.
-                    let pull_conflict = b.behind > 0 && !repo.pull_safe;
-                    if b.behind == 0 || repo.snapshot.has_conflicts || pull_conflict {
-                        continue;
-                    }
-                }
+            // A live merge/rebase conflict blocks any remote op outright. A
+            // merely dirty (but conflict-free) tree is *not* skipped here —
+            // `pull_safe` below is Phase 1.1's authoritative answer to
+            // whether a dirty tree can still fast-forward.
+            if repo.snapshot.has_conflicts {
+                outcome.conflicted += 1;
+                continue;
             }
-            if matches!(repo.state, RepoOpState::Idle) {
-                repo.state = RepoOpState::Queued;
+            if !mode_has_relevant_commits(repo, mode) {
+                outcome.no_updates += 1;
+                continue;
+            }
+            // Fast-forward safety is a Pull-only requirement. Merge and Rebase
+            // are the intentional ways to resolve diverged branches.
+            if mode == Mode::Pull && !repo.pull_safe {
+                outcome.unsafe_pull += 1;
+                continue;
+            }
+            if matches!(
+                repo.state,
+                RepoOpState::Idle | RepoOpState::Success(_) | RepoOpState::Fail { .. }
+            ) {
+                repo.state = RepoOpState::Queued(QueueOrigin::User);
+                outcome.selected += 1;
             }
         }
+        outcome
     }
 
     /// `A`: clear the queue AND all finished results/markers in one stroke —
     /// the bulk counterpart to per-repo Esc.
     fn clear_queue(&mut self) {
         for repo in &mut self.repos {
-            if matches!(repo.state, RepoOpState::Queued) || repo.state.has_result() {
+            if matches!(repo.state, RepoOpState::Queued(_)) || repo.state.has_result() {
                 repo.state = RepoOpState::Idle;
             }
             repo.fetch_error = None;
@@ -1085,27 +1215,35 @@ impl App {
         self.repos.iter_mut().find(|r| r.snapshot.path == path)
     }
 
-    /// Paths of tagged (Queued) repos, or just the cursor repo when none are
-    /// tagged, filtered by an additional per-repo predicate.
+    /// Paths of selected (Queued) repos, or just the cursor repo when none
+    /// are selected, filtered by an additional per-repo predicate.
     fn target_paths_where(&self, keep: impl Fn(&RepoView) -> bool) -> Vec<PathBuf> {
-        let queued: Vec<PathBuf> = self
-            .repos
-            .iter()
-            .filter(|r| r.is_queued())
-            .map(|r| r.snapshot.path.clone())
-            .collect();
-        let candidates: Vec<PathBuf> = if !queued.is_empty() {
-            queued
-        } else {
-            self.current_path().into_iter().collect()
-        };
-        candidates
-            .into_iter()
-            .filter(|p| self.repos.iter().any(|r| r.snapshot.path == *p && keep(r)))
-            .collect()
+        // Single O(n) pass: the previous version collected every selected
+        // path first and then, per path, rescanned all of `repos` to apply
+        // `keep` — O(n²) when most repos are selected.
+        let mut selected = Vec::new();
+        let mut any_queued = false;
+        for repo in &self.repos {
+            if repo.is_queued() {
+                any_queued = true;
+                if keep(repo) {
+                    selected.push(repo.snapshot.path.clone());
+                }
+            }
+        }
+        if any_queued {
+            // Some repos are selected but none pass `keep`: that's a real
+            // empty result, not "nothing selected" — falling back to the
+            // cursor here would silently target a repo the user never chose.
+            return selected;
+        }
+        match self.current() {
+            Some(repo) if keep(repo) => vec![repo.snapshot.path.clone()],
+            _ => Vec::new(),
+        }
     }
 
-    /// Paths of tagged (Queued) repos, or just the cursor repo when none are tagged.
+    /// Paths of selected (Queued) repos, or just the cursor repo when none are selected.
     fn target_paths(&self) -> Vec<PathBuf> {
         self.target_paths_where(|_| true)
     }
@@ -1120,7 +1258,7 @@ impl App {
         self.target_paths_where(|r| r.snapshot.stash_count > 0)
     }
 
-    /// True when more than one repo is targeted (queued).
+    /// True when more than one repo is targeted (selected).
     fn has_multi_target(&self) -> bool {
         self.repos.iter().filter(|r| r.is_queued()).count() > 1
     }
@@ -1373,35 +1511,38 @@ impl App {
     }
 
     fn spawn_load_worktrees(&self) {
+        // `order` preserves the repo table's current sort in the worktree
+        // view (buffer_unordered below completes out of order); `repo_path`
+        // is the stable identity each row is paired back to a repo with.
         let repos: Vec<_> = self
             .repos
             .iter()
             .enumerate()
-            .map(|(i, r)| (i, r.snapshot.path.clone(), r.snapshot.name.clone()))
+            .map(|(order, r)| (order, r.snapshot.path.clone(), r.snapshot.name.clone()))
             .collect();
         let tx = self.event_tx.clone();
         let runner = self.runner.clone();
         let cap = worker_limit();
         tokio::spawn(async move {
-            let mut results: Vec<(usize, String, String)> = stream::iter(repos)
-                .map(|(repo_idx, path, repo_name)| {
+            let mut results: Vec<(usize, PathBuf, String, String)> = stream::iter(repos)
+                .map(|(order, repo_path, repo_name)| {
                     let runner = runner.clone();
                     async move {
                         runner
-                            .worktree_list(&path)
+                            .worktree_list(&repo_path)
                             .await
                             .ok()
-                            .map(|listing| (repo_idx, repo_name, listing))
+                            .map(|listing| (order, repo_path, repo_name, listing))
                     }
                 })
                 .buffer_unordered(cap)
                 .filter_map(future::ready)
                 .collect()
                 .await;
-            results.sort_by_key(|(idx, ..)| *idx);
+            results.sort_by_key(|(order, ..)| *order);
 
             let mut wt_rows = Vec::new();
-            for (repo_idx, repo_name, listing) in results {
+            for (_, repo_path, repo_name, listing) in results {
                 let worktrees = parse_worktree_listing(&listing);
                 if worktrees.len() <= 1 {
                     let path = worktrees
@@ -1413,7 +1554,7 @@ impl App {
                         path,
                         display_name: repo_name.clone(),
                         wt_label: repo_name.clone(),
-                        repo_idx,
+                        repo_path: repo_path.clone(),
                     });
                 } else {
                     for wt in worktrees {
@@ -1431,7 +1572,7 @@ impl App {
                             path: wt.path,
                             display_name: repo_name.clone(),
                             wt_label,
-                            repo_idx,
+                            repo_path: repo_path.clone(),
                         });
                     }
                 }
@@ -1440,10 +1581,25 @@ impl App {
         });
     }
 
-    fn drain_events(&mut self) {
+    /// Returns whether any event was actually applied — the event-loop redraw
+    /// gate's signal for "state changed since the last frame".
+    fn drain_events(&mut self) -> bool {
+        let mut any = false;
         while let Ok(event) = self.event_rx.try_recv() {
             self.apply_bg_event(event);
+            any = true;
         }
+        any
+    }
+
+    /// True while something on screen is mid-animation — a spinner or a
+    /// counting-down notice — and therefore needs a redraw every tick even
+    /// with no new event to react to.
+    fn is_animating(&self) -> bool {
+        self.loading
+            || self.any_working()
+            || self.repos.iter().any(|r| r.fetching)
+            || self.active_notice().is_some()
     }
 
     fn apply_bg_event(&mut self, event: BgEvent) {
@@ -1582,7 +1738,7 @@ impl App {
                         repo.snapshot = snap;
                         repo.pull_safe = queue;
                         if queue {
-                            repo.state = RepoOpState::Queued;
+                            repo.state = RepoOpState::Queued(QueueOrigin::Auto);
                         }
                     }
                 }
@@ -1594,958 +1750,76 @@ impl App {
                     }
                 }
             }
+            BgEvent::WorktreeOpResult {
+                repo_path,
+                label,
+                result,
+            } => {
+                if let Some(repo) = self.repo_mut(&repo_path) {
+                    repo.state = op_state_from_result(&result, label);
+                }
+                // Keeps both the repo table (dirty/ahead/behind, stash
+                // count, …) and the worktree table itself in sync — a
+                // remove/lock/add changes what `git worktree list` reports.
+                self.spawn_refresh();
+                if self.worktree_mode {
+                    self.spawn_load_worktrees();
+                }
+            }
+            BgEvent::PanelReady { kind, result } => {
+                // Drop a result for a fetch the user has since moved past
+                // (closed the panel, or opened a different kind) instead of
+                // popping a stale view back open.
+                if self.pending_panel != Some(kind) {
+                    return;
+                }
+                self.pending_panel = None;
+                match result {
+                    Ok(state) => self.panel = Some(state),
+                    Err(e) => {
+                        self.panel = None;
+                        self.set_notice(format!("Could not load panel: {e}"));
+                    }
+                }
+            }
         }
     }
 
     // ── Operations ────────────────────────────────────────────────────────────
 
     fn run_current_mode(&mut self) {
-        let paths = self.target_paths();
-        if paths.is_empty() {
-            return;
-        }
-        let action = RemoteAction::from_mode(self.mode);
-        for path in paths {
-            self.spawn_op(path, action.clone());
-        }
+        self.run_action_on_targets(self.mode);
     }
 
-    /// Run a remote action (fetch/pull/push) on all target repos.
+    /// Run a remote action (fetch/pull/merge/rebase/push) on all target
+    /// repos — directly for a single target or for a mode that only reads
+    /// from the remote, otherwise (mode writes to the remote, e.g. push,
+    /// and more than one repo is targeted) behind a confirmation naming the
+    /// mode and repo count.
+    ///
+    /// This is the single chokepoint for every outward-facing batch trigger
+    /// (`Enter`, `p`, `P`, `f`), so a multi-repo push can never fire without
+    /// the user seeing its scope first. Fetch/pull/merge/rebase only read
+    /// from the remote and write locally — reverting a bad local result is
+    /// cheap, so they fan out without asking.
     fn run_action_on_targets(&mut self, mode: Mode) {
         let paths = self.target_paths();
-        let action = RemoteAction::from_mode(mode);
-        for path in paths {
-            self.spawn_op(path, action.clone());
-        }
-    }
-
-    // ── Panel handling ────────────────────────────────────────────────────────
-
-    async fn open_panel(&mut self, kind: PanelKind) -> Result<()> {
-        let Some(path) = self.current_path() else {
-            return Ok(());
-        };
-        let runner = &self.runner;
-
-        let multi = self.has_multi_target();
-
-        // For Branches with multiple tagged repos: show only branches
-        // common to ALL targets (the intersection).
-        if multi && kind == PanelKind::Branches {
-            let paths = self.target_paths();
-            let n = paths.len();
-            let runner = runner.clone();
-
-            // Query all repos concurrently — a serial loop would stall the UI
-            // for the sum of the git round-trips.
-            let outputs = future::try_join_all(paths.iter().map(|p| {
-                let runner = runner.clone();
-                async move { runner.branch_list(p).await }
-            }))
-            .await?;
-            let name_sets: Vec<HashSet<String>> = outputs
-                .iter()
-                .map(|o| parse_branch_names(&filter_tracked_remotes(o)))
-                .collect();
-
-            // Intersect all sets.
-            let common = if let Some(first) = name_sets.first() {
-                let mut acc = first.clone();
-                for s in &name_sets[1..] {
-                    acc.retain(|name| s.contains(name));
-                }
-                acc
-            } else {
-                HashSet::new()
-            };
-
-            let mut names: Vec<&str> = common.iter().map(std::string::String::as_str).collect();
-            names.sort_unstable();
-
-            let title = format!("Branches ({n} repos)");
-            let content = names.join("\n");
-
-            self.panel = Some(PanelState::new_navigable(kind, title, content));
-            return Ok(());
-        }
-
-        let (title, content) = match kind {
-            PanelKind::Branches => (
-                "Branches".into(),
-                filter_tracked_remotes(&runner.branch_list(&path).await?),
-            ),
-            PanelKind::Commits => ("Commits".into(), runner.commit_log(&path).await?),
-            PanelKind::Status => ("Status".into(), runner.status_text(&path).await?),
-        };
-
-        self.panel = Some(match kind {
-            PanelKind::Branches => PanelState::new_navigable(kind, title, content),
-            _ => PanelState::new_text(kind, title, content),
-        });
-        Ok(())
-    }
-
-    async fn refresh_panel(&mut self) -> Result<()> {
-        let Some(kind) = self.panel_kind() else {
-            return Ok(());
-        };
-        self.open_panel(kind).await
-    }
-
-    // ── Prompt submission ─────────────────────────────────────────────────────
-
-    async fn submit_prompt(&mut self, prompt: PromptState) -> Result<()> {
-        let input = prompt.input.trim().to_string();
-        if input.is_empty() && prompt.kind != PromptKind::Stash {
-            return Ok(());
-        }
-
-        // Determine the local action and the set of target repos.
-        // Batchable actions fan out over all targets; worktree ops stay single.
-        let (action, paths): (LocalAction, Vec<PathBuf>) = match prompt.kind {
-            PromptKind::Commit => {
-                let desc = prompt.description.trim().to_string();
-                let full_msg = if desc.is_empty() {
-                    input
-                } else {
-                    format!("{input}\n\n{desc}")
-                };
-                (LocalAction::Commit(full_msg), self.target_paths_dirty())
-            }
-            PromptKind::Branch => (LocalAction::CreateBranch(input), self.target_paths()),
-            PromptKind::Stash => {
-                let msg = if input.is_empty() { None } else { Some(input) };
-                (LocalAction::StashPush(msg), self.target_paths_dirty())
-            }
-            PromptKind::CheckoutBranch => (LocalAction::Checkout(input), self.target_paths()),
-            PromptKind::DeleteBranch => (LocalAction::DeleteBranch(input), self.target_paths()),
-            PromptKind::ForceDeleteBranch => {
-                (LocalAction::ForceDeleteBranch(input), self.target_paths())
-            }
-            PromptKind::CheckoutRemoteBranch => {
-                (LocalAction::CheckoutRemote(input), self.target_paths())
-            }
-            PromptKind::DeleteRemoteBranch => {
-                (LocalAction::DeleteRemoteBranch(input), self.target_paths())
-            }
-            PromptKind::SetUpstream => {
-                // "origin" pairs each repo with its own current branch;
-                // "origin/main" sets the same fixed target everywhere.
-                let (remote, fixed_branch) = match input.split_once('/') {
-                    Some((r, b)) => (r.to_string(), Some(b.to_string())),
-                    None => (input, None),
-                };
-                for path in self.target_paths() {
-                    let branch = fixed_branch.clone().or_else(|| {
-                        self.repos
-                            .iter()
-                            .find(|r| r.snapshot.path == path)
-                            .map(|r| r.snapshot.branch.name.clone())
-                    });
-                    if let Some(branch) = branch {
-                        self.spawn_local_op(
-                            path,
-                            LocalAction::SetUpstream {
-                                remote: remote.clone(),
-                                branch,
-                            },
-                        );
-                    }
-                }
-                return Ok(());
-            }
-            PromptKind::WorktreeBranch => {
-                // Worktree operations stay single-repo (not meaningful to batch).
-                let Some(path) = self.current_path() else {
-                    return Ok(());
-                };
-                let dest = default_worktree_path(&path, prompt.input.trim());
-                let result = self
-                    .runner
-                    .worktree_add(&path, &dest, prompt.input.trim(), true)
-                    .await;
-                let snap = self.runner.status_snapshot(&path).await?;
-                if let Some(repo) = self.repo_mut(&path) {
-                    repo.state = op_state_from_result(&result, "new worktree done");
-                    repo.snapshot = snap;
-                }
-                return self.refresh_panel().await;
-            }
-        };
-
         if paths.is_empty() {
-            return Ok(());
-        }
-
-        // Fan out as background tasks.
-        for path in paths {
-            self.spawn_local_op(path, action.clone());
-        }
-        self.panel = None;
-        Ok(())
-    }
-
-    // ── Auth prompt ───────────────────────────────────────────────────────────
-
-    fn enqueue_auth_prompt(&mut self, path: PathBuf, action: RemoteAction) {
-        if self
-            .auth_prompt
-            .as_ref()
-            .is_some_and(|p| p.repo_path == path)
-            || self.auth_prompt_queue.iter().any(|p| p.repo_path == path)
-        {
             return;
         }
-        let prompt = AuthPromptState {
-            repo_name: self.repo_name_for_path(&path),
-            repo_path: path,
-            action,
-            username: String::new(),
-            password: String::new(),
-            input: String::new(),
-            field: CredentialField::Username,
-        };
-        if self.auth_prompt.is_none() {
-            self.auth_prompt = Some(prompt);
-        } else {
-            self.auth_prompt_queue.push_back(prompt);
-        }
-    }
-
-    fn advance_auth_prompt(&mut self) {
-        self.auth_prompt = self.auth_prompt_queue.pop_front();
-    }
-
-    fn submit_auth_prompt(&mut self, mut prompt: AuthPromptState) -> Result<()> {
-        match prompt.field {
-            CredentialField::Username => {
-                prompt.username = prompt.input.trim().to_string();
-                prompt.field = CredentialField::Password;
-                prompt.input = String::new();
-                self.auth_prompt = Some(prompt);
-                return Ok(());
+        if paths.len() == 1 || !mode_writes_to_remote(mode) {
+            let action = RemoteAction::from_mode(mode);
+            for path in paths {
+                self.spawn_op(path, action.clone());
             }
-            CredentialField::Password => {
-                prompt.password = prompt.input.clone();
-            }
-        }
-        let creds = Credentials {
-            username: prompt.username.trim().to_string(),
-            password: prompt.password.clone(),
-        };
-        self.spawn_op_with_credentials(prompt.repo_path, prompt.action, creds);
-        self.advance_auth_prompt();
-        Ok(())
-    }
-
-    fn cancel_auth_prompt(&mut self) {
-        if let Some(prompt) = self.auth_prompt.take()
-            && let Some(repo) = self
-                .repos
-                .iter_mut()
-                .find(|r| r.snapshot.path == prompt.repo_path)
-        {
-            repo.state = RepoOpState::Fail {
-                message: "credentials cancelled".into(),
-                kind: FailKind::Generic,
-            };
-        }
-        self.advance_auth_prompt();
-    }
-
-    // ── Confirm prompt ────────────────────────────────────────────────────────
-
-    fn enqueue_confirm(&mut self, prompt: ConfirmPromptState) {
-        // Repeated push failures must not stack duplicate force-push dialogs.
-        if let ConfirmAction::ForcePush { path } = &prompt.action {
-            let same = |p: &ConfirmPromptState| matches!(&p.action, ConfirmAction::ForcePush { path: other } if other == path);
-            if self.confirm_prompt.as_ref().is_some_and(same)
-                || self.confirm_prompt_queue.iter().any(same)
-            {
-                return;
-            }
-        }
-        if self.confirm_prompt.is_none() {
-            self.confirm_prompt = Some(prompt);
-        } else {
-            self.confirm_prompt_queue.push_back(prompt);
-        }
-    }
-
-    fn dismiss_confirm(&mut self) {
-        self.confirm_prompt = self.confirm_prompt_queue.pop_front();
-    }
-
-    fn execute_confirm(&mut self, hard: bool) {
-        let Some(prompt) = self.confirm_prompt.take() else {
             return;
-        };
-        self.confirm_prompt = self.confirm_prompt_queue.pop_front();
-        match prompt.action {
-            ConfirmAction::ForcePush { path } => {
-                self.spawn_op(path, RemoteAction::Push { force: true });
-            }
-            ConfirmAction::StashDrop { paths } => {
-                for path in paths {
-                    self.spawn_local_op(path, LocalAction::StashDrop);
-                }
-            }
-            ConfirmAction::DeleteBranch { name, paths } => {
-                for path in paths {
-                    self.spawn_local_op(path, LocalAction::DeleteBranch(name.clone()));
-                }
-            }
-            ConfirmAction::ForceDeleteBranch { name, paths } => {
-                for path in paths {
-                    self.spawn_local_op(path, LocalAction::ForceDeleteBranch(name.clone()));
-                }
-            }
-            ConfirmAction::DeleteRemoteBranch { name, paths } => {
-                for path in paths {
-                    self.spawn_local_op(path, LocalAction::DeleteRemoteBranch(name.clone()));
-                }
-            }
-            ConfirmAction::ResetToUpstream { paths } => {
-                for path in paths {
-                    self.spawn_local_op(path, LocalAction::ResetUpstream { hard });
-                }
-            }
         }
-    }
-
-    /// Subject line for a confirm dialog: the repo name, or the batch size.
-    fn confirm_subject(&self, paths: &[PathBuf]) -> String {
-        if paths.len() == 1 {
-            self.repo_name_for_path(&paths[0])
-                .unwrap_or_else(|| "1 repo".into())
-        } else {
-            format!("{} repos", paths.len())
-        }
-    }
-
-    // ── Worktree helpers ──────────────────────────────────────────────────────
-
-    async fn remove_selected_worktree(&mut self) -> Result<()> {
-        let Some(path) = self.current_path() else {
-            return Ok(());
-        };
-        let ctx = worktree_context(&self.runner, &path).await?;
-        if ctx.selected_is_primary {
-            if let Some(repo) = self.current_mut() {
-                repo.state = RepoOpState::Fail {
-                    message: "cannot remove primary worktree".into(),
-                    kind: FailKind::Generic,
-                };
-            }
-            return Ok(());
-        }
-        let result = self.runner.worktree_remove(&ctx.primary_path, &path).await;
-        if let Some(repo) = self.current_mut() {
-            repo.state = op_state_from_result(&result, "worktree removed");
-        }
-        self.spawn_refresh();
-        Ok(())
-    }
-
-    async fn toggle_worktree_lock(&mut self) -> Result<()> {
-        let Some(path) = self.current_path() else {
-            return Ok(());
-        };
-        let ctx = worktree_context(&self.runner, &path).await?;
-        if ctx.selected_is_primary {
-            if let Some(repo) = self.current_mut() {
-                repo.state = RepoOpState::Fail {
-                    message: "cannot lock primary worktree".into(),
-                    kind: FailKind::Generic,
-                };
-            }
-            return Ok(());
-        }
-        let result = if ctx.selected_is_locked {
-            self.runner.worktree_unlock(&ctx.primary_path, &path).await
-        } else {
-            self.runner.worktree_lock(&ctx.primary_path, &path).await
-        };
-        if let Some(repo) = self.current_mut() {
-            repo.state = op_state_from_result(&result, "worktree lock toggled");
-        }
-        Ok(())
-    }
-
-    // ── Key handling ──────────────────────────────────────────────────────────
-
-    async fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<bool> {
-        if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
-            return Ok(true);
-        }
-
-        // Allow quit during loading
-        if self.loading {
-            return Ok(code == KeyCode::Char('q') || code == KeyCode::Char('Q'));
-        }
-
-        if self.auth_prompt.is_some() {
-            return self.handle_auth_key(code).await;
-        }
-        if self.confirm_prompt.is_some() {
-            return self.handle_confirm_key(code);
-        }
-        if self.prompt.is_some() {
-            return self.handle_prompt_key(code, mods).await;
-        }
-        if self.show_help {
-            match code {
-                KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return Ok(true),
-                KeyCode::Esc | KeyCode::Char('?' | 'q') => {
-                    self.show_help = false;
-                }
-                KeyCode::Down | KeyCode::Char('j') => self.help_scroll += 1,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.help_scroll = self.help_scroll.saturating_sub(1);
-                }
-                KeyCode::PageDown => self.help_scroll += 10,
-                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
-                KeyCode::Char('g') | KeyCode::Home => self.help_scroll = 0,
-                // usize::MAX would overflow the += arms; the draw clamps this.
-                KeyCode::Char('G') | KeyCode::End => self.help_scroll = usize::MAX / 2,
-                // Swallow everything else while help is open.
-                _ => {}
-            }
-            return Ok(false);
-        }
-        if self.panel.is_some() && self.handle_panel_key(code, mods)? {
-            return Ok(false);
-        }
-
-        match code {
-            KeyCode::Char('q' | 'Q') => return Ok(true),
-            KeyCode::Char('?') => {
-                self.show_help = true;
-                self.help_scroll = 0;
-            }
-            KeyCode::Esc => {
-                if self.panel.is_some() {
-                    self.panel = None;
-                } else if let Some(repo) = self.current_mut() {
-                    // Clear success/fail state on Esc
-                    if repo.state.has_result() {
-                        repo.state = RepoOpState::Idle;
-                    }
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
-            KeyCode::Char('g') | KeyCode::Home => {
-                if self.worktree_mode {
-                    self.wt_cursor = 0;
-                } else {
-                    self.cursor = 0;
-                }
-            }
-            KeyCode::Char('G') | KeyCode::End => {
-                if self.worktree_mode {
-                    self.wt_cursor = self.wt_rows.len().saturating_sub(1);
-                } else {
-                    self.cursor = self.repos.len().saturating_sub(1);
-                }
-            }
-            KeyCode::PageUp => self.move_cursor(-MAIN_PAGE_JUMP),
-            KeyCode::PageDown => self.move_cursor(MAIN_PAGE_JUMP),
-            KeyCode::Left => self.msg_scroll = self.msg_scroll.saturating_sub(4),
-            KeyCode::Right => self.msg_scroll = self.msg_scroll.saturating_add(4),
-            KeyCode::Char(' ') => self.toggle_queue(),
-            KeyCode::Enter => self.run_current_mode(),
-            KeyCode::Char('a') => self.queue_all(),
-            KeyCode::Char('A') => self.clear_queue(),
-            KeyCode::Char('m') => self.mode = self.mode.cycle(),
-            KeyCode::Char('t') => self.toggle_sort(),
-            KeyCode::Char('b') => self.open_panel(PanelKind::Branches).await?,
-            KeyCode::Char('s') => self.open_panel(PanelKind::Status).await?,
-            KeyCode::Char('v') => self.open_panel(PanelKind::Commits).await?,
-            KeyCode::Char('f') => self.run_action_on_targets(Mode::Fetch),
-            KeyCode::Char('p') => self.run_action_on_targets(Mode::Pull),
-            KeyCode::Char('P') => self.run_action_on_targets(Mode::Push),
-            KeyCode::Char('c') => {
-                // Clear error/success state first; if clean, show commit prompt
-                if let Some(repo) = self.current_mut()
-                    && repo.state.has_result()
-                {
-                    repo.state = RepoOpState::Idle;
-                    return Ok(false);
-                }
-                self.show_prompt(PromptKind::Commit);
-            }
-            KeyCode::Char('n') => {
-                let kind = if self.worktree_mode {
-                    PromptKind::WorktreeBranch
-                } else {
-                    PromptKind::Branch
-                };
-                self.show_prompt(kind);
-            }
-            KeyCode::Char('u') => {
-                self.show_prompt_prefilled(PromptKind::SetUpstream, "origin".into());
-            }
-            KeyCode::Char('U') => {
-                let paths = self.target_paths_where(|r| !r.snapshot.branch.no_upstream);
-                if !paths.is_empty() {
-                    let subject = self.confirm_subject(&paths);
-                    self.enqueue_confirm(ConfirmPromptState {
-                        title: "Reset to Upstream?",
-                        subject,
-                        warning: "Mixed keeps your changes; hard DISCARDS all local \
-                                  changes and commits."
-                            .into(),
-                        action: ConfirmAction::ResetToUpstream { paths },
-                    });
-                }
-            }
-            KeyCode::Char('S') => self.show_prompt(PromptKind::Stash),
-            KeyCode::Char('O') => {
-                for path in self.target_paths_with_stash() {
-                    self.spawn_local_op(path, LocalAction::StashPop);
-                }
-            }
-            KeyCode::Char('D') => {
-                let paths = self.target_paths_with_stash();
-                if !paths.is_empty() {
-                    let subject = self.confirm_subject(&paths);
-                    self.enqueue_confirm(ConfirmPromptState {
-                        title: "Drop Stash?",
-                        subject,
-                        warning: "Discards the newest stash entry — cannot be undone.".into(),
-                        action: ConfirmAction::StashDrop { paths },
-                    });
-                }
-            }
-            KeyCode::Char('W') => {
-                self.worktree_mode = !self.worktree_mode;
-                if self.worktree_mode {
-                    self.wt_rows.clear();
-                    self.wt_cursor = 0;
-                    self.wt_offset = 0;
-                    self.spawn_load_worktrees();
-                }
-            }
-            KeyCode::Char('d') if self.worktree_mode => {
-                self.remove_selected_worktree().await?;
-            }
-            KeyCode::Char('L') if self.worktree_mode => {
-                self.toggle_worktree_lock().await?;
-            }
-            KeyCode::Char('X') if self.worktree_mode => {
-                if let Some(p) = self.current_path() {
-                    let runner = self.runner.clone();
-                    let result = runner.worktree_prune(&p).await;
-                    self.apply_local_result(p, result).await?;
-                }
-            }
-            KeyCode::Tab => self.open_lazygit()?,
-            _ => {}
-        }
-        Ok(false)
-    }
-
-    async fn apply_local_result(&mut self, path: PathBuf, result: Result<String>) -> Result<()> {
-        let snap = self.runner.status_snapshot(&path).await?;
-        if let Some(repo) = self.repo_mut(&path) {
-            repo.state = op_state_from_result(&result, "done");
-            repo.snapshot = snap;
-        }
-        self.refresh_panel().await
-    }
-
-    fn show_prompt(&mut self, kind: PromptKind) {
-        self.prompt = Some(PromptState {
-            kind,
-            input: String::new(),
-            cursor: 0,
-            error: None,
-            description: String::new(),
-            commit_field: CommitField::Subject,
+        self.enqueue_confirm(ConfirmPromptState {
+            title: confirm_title_for_mode(mode),
+            subject: confirm_subject_for_mode(mode, paths.len()),
+            warning: confirm_warning_for_mode(mode),
+            action: ConfirmAction::RunMode { mode, paths },
         });
-    }
-
-    fn show_prompt_prefilled(&mut self, kind: PromptKind, value: String) {
-        self.show_prompt(kind);
-        if let Some(ref mut p) = self.prompt {
-            p.cursor = value.len();
-            p.input = value;
-        }
-    }
-
-    async fn handle_prompt_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<bool> {
-        let Some(ref mut prompt) = self.prompt else {
-            return Ok(false);
-        };
-        let is_commit = prompt.kind == PromptKind::Commit;
-        // The multi-line commit description stays append-only; cursor editing
-        // applies to the single-line input field.
-        let in_desc = is_commit && prompt.commit_field == CommitField::Description;
-
-        match code {
-            KeyCode::Esc => {
-                self.prompt = None;
-            }
-            KeyCode::Tab if is_commit => {
-                prompt.commit_field = match prompt.commit_field {
-                    CommitField::Subject => CommitField::Description,
-                    CommitField::Description => CommitField::Subject,
-                };
-            }
-            KeyCode::Left if !in_desc => {
-                prompt.cursor = prev_char_boundary(&prompt.input, prompt.cursor);
-            }
-            KeyCode::Right if !in_desc => {
-                prompt.cursor = next_char_boundary(&prompt.input, prompt.cursor);
-            }
-            KeyCode::Home if !in_desc => prompt.cursor = 0,
-            KeyCode::End if !in_desc => prompt.cursor = prompt.input.len(),
-            KeyCode::Delete if !in_desc => {
-                let next = next_char_boundary(&prompt.input, prompt.cursor);
-                if next > prompt.cursor {
-                    prompt.input.replace_range(prompt.cursor..next, "");
-                    prompt.error = None;
-                }
-            }
-            KeyCode::Backspace => {
-                if in_desc {
-                    prompt.description.pop();
-                } else if mods.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) {
-                    let start = word_back_start(&prompt.input, prompt.cursor);
-                    prompt.input.replace_range(start..prompt.cursor, "");
-                    prompt.cursor = start;
-                    prompt.error = None;
-                } else {
-                    let prev = prev_char_boundary(&prompt.input, prompt.cursor);
-                    if prev < prompt.cursor {
-                        prompt.input.replace_range(prev..prompt.cursor, "");
-                        prompt.cursor = prev;
-                        prompt.error = None;
-                    }
-                }
-            }
-            // Many terminals send Ctrl+Backspace as Ctrl+W or Ctrl+H.
-            KeyCode::Char('w' | 'h') if mods.contains(KeyModifiers::CONTROL) && !in_desc => {
-                let start = word_back_start(&prompt.input, prompt.cursor);
-                prompt.input.replace_range(start..prompt.cursor, "");
-                prompt.cursor = start;
-                prompt.error = None;
-            }
-            KeyCode::Enter => {
-                if in_desc {
-                    prompt.description.push('\n');
-                } else {
-                    if matches!(prompt.kind, PromptKind::Branch | PromptKind::WorktreeBranch)
-                        && let Err(msg) = validate_branch_name(prompt.input.trim())
-                    {
-                        prompt.error = Some(msg);
-                        return Ok(false);
-                    }
-                    if let Some(prompt) = self.prompt.take() {
-                        self.submit_prompt(prompt).await?;
-                    }
-                }
-            }
-            KeyCode::Char(ch) if !mods.contains(KeyModifiers::CONTROL) => {
-                if in_desc {
-                    prompt.description.push(ch);
-                } else {
-                    prompt.input.insert(prompt.cursor, ch);
-                    prompt.cursor += ch.len_utf8();
-                    prompt.error = None;
-                }
-            }
-            _ => {}
-        }
-        Ok(false)
-    }
-
-    fn handle_paste(&mut self, text: &str) {
-        if let Some(ref mut p) = self.prompt {
-            if p.kind == PromptKind::Commit && p.commit_field == CommitField::Description {
-                p.description.push_str(&text.replace('\r', ""));
-            } else {
-                // Single-line field: take the first line so an embedded
-                // newline can't submit the prompt prematurely.
-                let line = text.lines().next().unwrap_or("").replace('\r', "");
-                p.input.insert_str(p.cursor, &line);
-                p.cursor += line.len();
-                p.error = None;
-            }
-        } else if let Some(ref mut a) = self.auth_prompt {
-            let line = text.lines().next().unwrap_or("").replace('\r', "");
-            a.input.push_str(&line);
-        }
-    }
-
-    async fn handle_auth_key(&mut self, code: KeyCode) -> Result<bool> {
-        match code {
-            KeyCode::Esc => self.cancel_auth_prompt(),
-            KeyCode::Tab => {
-                if let Some(ref mut p) = self.auth_prompt {
-                    match p.field {
-                        CredentialField::Username => {
-                            p.username = p.input.trim().to_string();
-                            p.field = CredentialField::Password;
-                            p.input = String::new();
-                        }
-                        CredentialField::Password => {
-                            p.password = p.input.clone();
-                            p.field = CredentialField::Username;
-                            p.input = p.username.clone();
-                        }
-                    }
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(ref mut p) = self.auth_prompt {
-                    p.input.pop();
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(prompt) = self.auth_prompt.take() {
-                    self.submit_auth_prompt(prompt)?;
-                }
-            }
-            KeyCode::Char(ch) => {
-                if let Some(ref mut p) = self.auth_prompt {
-                    p.input.push(ch);
-                }
-            }
-            _ => {}
-        }
-        Ok(false)
-    }
-
-    fn handle_confirm_key(&mut self, code: KeyCode) -> Result<bool> {
-        match code {
-            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
-                self.dismiss_confirm();
-            }
-            KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
-                self.execute_confirm(false);
-            }
-            KeyCode::Char('H') => {
-                let is_reset = matches!(
-                    self.confirm_prompt.as_ref().map(|p| &p.action),
-                    Some(ConfirmAction::ResetToUpstream { .. })
-                );
-                if is_reset {
-                    self.execute_confirm(true);
-                }
-            }
-            _ => {}
-        }
-        Ok(false)
-    }
-
-    /// Branch name under the panel cursor, stripped of `* + ` markers.
-    fn selected_branch_name(&self) -> Option<String> {
-        self.panel
-            .as_ref()
-            .and_then(|p| p.selected_text())
-            .and_then(parse_branch_name)
-            .map(ToString::to_string)
-    }
-
-    /// Delete a remote branch (`origin/x` form): confirm dialog when fanning
-    /// out over tagged repos, editable prompt for a single repo.
-    fn remote_delete_flow(&mut self, name: String) {
-        if self.has_multi_target() {
-            let paths = self.target_paths();
-            self.enqueue_confirm(ConfirmPromptState {
-                title: "Delete Remote Branch?",
-                subject: format!("'{name}' in {} repos", paths.len()),
-                warning: "Deletes the branch on the remote — affects everyone.".into(),
-                action: ConfirmAction::DeleteRemoteBranch { name, paths },
-            });
-        } else {
-            self.show_prompt_prefilled(PromptKind::DeleteRemoteBranch, name);
-        }
-    }
-
-    fn handle_panel_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<bool> {
-        let Some(panel) = &self.panel else {
-            return Ok(false);
-        };
-        let kind = panel.kind;
-        let is_navigable = panel.is_navigable();
-
-        // Only quit (Ctrl+C) and close (Esc) fall through to the main handler;
-        // every other key is consumed while a panel is open.
-        if code == KeyCode::Esc {
-            return Ok(false);
-        }
-        if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
-            return Ok(false);
-        }
-
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                if let Some(p) = &mut self.panel {
-                    if is_navigable {
-                        p.move_cursor(-1, 20);
-                    } else {
-                        p.scroll_text(-1, 20);
-                    }
-                }
-                return Ok(true);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if let Some(p) = &mut self.panel {
-                    if is_navigable {
-                        p.move_cursor(1, 20);
-                    } else {
-                        p.scroll_text(1, 20);
-                    }
-                }
-                return Ok(true);
-            }
-            KeyCode::PageUp => {
-                if let Some(p) = &mut self.panel {
-                    if is_navigable {
-                        p.move_cursor(-10, 20);
-                    } else {
-                        p.scroll_text(-10, 20);
-                    }
-                }
-                return Ok(true);
-            }
-            KeyCode::PageDown => {
-                if let Some(p) = &mut self.panel {
-                    if is_navigable {
-                        p.move_cursor(10, 20);
-                    } else {
-                        p.scroll_text(10, 20);
-                    }
-                }
-                return Ok(true);
-            }
-            KeyCode::Char('g') | KeyCode::Home => {
-                if let Some(p) = &mut self.panel {
-                    if is_navigable {
-                        p.cursor_to(0, 20);
-                    } else {
-                        p.scroll = 0;
-                    }
-                }
-                return Ok(true);
-            }
-            KeyCode::Char('G') | KeyCode::End => {
-                if let Some(p) = &mut self.panel {
-                    if is_navigable {
-                        p.cursor_to(p.lines.len().saturating_sub(1), 20);
-                    } else {
-                        p.scroll_text(p.lines.len() as isize, 20);
-                    }
-                }
-                return Ok(true);
-            }
-            KeyCode::Char('q') => {
-                self.panel = None;
-                return Ok(true);
-            }
-            KeyCode::Char('n') if kind == PanelKind::Branches => {
-                self.panel = None;
-                self.show_prompt(PromptKind::Branch);
-                return Ok(true);
-            }
-            KeyCode::Char('c' | ' ') if kind == PanelKind::Branches => {
-                let name = self.selected_branch_name();
-                if let Some(name) = name {
-                    self.panel = None;
-                    // A `remotes/origin/x` row must go through the tracking
-                    // checkout (short name + --track), not a literal checkout
-                    // that would detach HEAD.
-                    if let Some(short) = remote_short_ref(&name).map(String::from) {
-                        if self.has_multi_target() {
-                            for path in self.target_paths() {
-                                self.spawn_local_op(
-                                    path,
-                                    LocalAction::CheckoutRemote(short.clone()),
-                                );
-                            }
-                        } else {
-                            self.show_prompt_prefilled(PromptKind::CheckoutRemoteBranch, short);
-                        }
-                    } else if self.has_multi_target() {
-                        for path in self.target_paths() {
-                            self.spawn_local_op(path, LocalAction::Checkout(name.clone()));
-                        }
-                    } else {
-                        self.show_prompt_prefilled(PromptKind::CheckoutBranch, name);
-                    }
-                }
-                return Ok(true);
-            }
-            KeyCode::Char('d') if kind == PanelKind::Branches => {
-                let name = self.selected_branch_name();
-                if let Some(name) = name {
-                    self.panel = None;
-                    if let Some(short) = remote_short_ref(&name).map(String::from) {
-                        self.remote_delete_flow(short);
-                    } else if self.has_multi_target() {
-                        let paths = self.target_paths();
-                        self.enqueue_confirm(ConfirmPromptState {
-                            title: "Delete Branch?",
-                            subject: format!("'{name}' in {} repos", paths.len()),
-                            warning: "Unmerged commits may be kept only in reflogs.".into(),
-                            action: ConfirmAction::DeleteBranch { name, paths },
-                        });
-                    } else {
-                        self.show_prompt_prefilled(PromptKind::DeleteBranch, name);
-                    }
-                }
-                return Ok(true);
-            }
-            KeyCode::Char('D') if kind == PanelKind::Branches => {
-                let name = self.selected_branch_name();
-                if let Some(name) = name {
-                    self.panel = None;
-                    // Remote branches have no force-delete variant; treat D like d.
-                    if let Some(short) = remote_short_ref(&name).map(String::from) {
-                        self.remote_delete_flow(short);
-                    } else if self.has_multi_target() {
-                        let paths = self.target_paths();
-                        self.enqueue_confirm(ConfirmPromptState {
-                            title: "Force Delete Branch?",
-                            subject: format!("'{name}' in {} repos", paths.len()),
-                            warning: "Unmerged commits on this branch will be lost.".into(),
-                            action: ConfirmAction::ForceDeleteBranch { name, paths },
-                        });
-                    } else {
-                        self.show_prompt_prefilled(PromptKind::ForceDeleteBranch, name);
-                    }
-                }
-                return Ok(true);
-            }
-            // Swallow everything else so main-list hotkeys don't fire behind the panel.
-            _ => {}
-        }
-        Ok(true)
-    }
-
-    fn open_lazygit(&mut self) -> Result<()> {
-        let Some(path) = self.current_path() else {
-            return Ok(());
-        };
-        disable_raw_mode()?;
-        execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
-        let status = Command::new("lazygit").arg("-p").arg(&path).status();
-        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
-        enable_raw_mode()?;
-        if status.is_err()
-            && let Some(repo) = self.current_mut()
-        {
-            repo.state = RepoOpState::Fail {
-                message: "lazygit failed to launch (is it installed and on PATH?)".into(),
-                kind: FailKind::Generic,
-            };
-        }
-        self.spawn_refresh();
-        self.needs_full_redraw = true;
-        Ok(())
     }
 
     fn any_working(&self) -> bool {
@@ -2572,8 +1846,28 @@ pub async fn run(runner: GitRunner, config: &AppConfig, repositories: Vec<PathBu
     let mut app = App::new(runner, mode, config.auto_stash, repositories.len());
     app.start_loading(repositories);
 
+    // Every routine error source (a failed git command, a bad panel fetch,
+    // …) is now caught well before it reaches here — see `handle_key` and
+    // its callees. What can still surface is a genuine terminal-control
+    // failure (crossterm/ratatui I/O). Even then, restore the terminal
+    // before propagating: an early `?` here used to skip `restore_terminal`
+    // entirely, leaving raw mode and the alternate screen engaged and the
+    // user's shell looking broken until they blindly typed `reset`.
+    let outcome = run_event_loop(&mut terminal, &mut app).await;
+    restore_terminal(terminal)?;
+    outcome
+}
+
+async fn run_event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+    // An idle gitbatch sitting on a couple hundred repos has no reason to
+    // repaint 12.5 times a second: redraw only when a background event
+    // landed, a key/paste/resize was handled, or something is mid-animation
+    // (a spinner, a counting-down notice) and needs the next tick's frame.
+    // Background events still drain and mutate state every loop iteration
+    // either way — only the terminal repaint itself is what's gated.
+    let mut needs_redraw = true;
     loop {
-        app.drain_events();
+        let events_applied = app.drain_events();
         app.tick = app.tick.wrapping_add(1);
 
         if !app.loading
@@ -2585,11 +1879,17 @@ pub async fn run(runner: GitRunner, config: &AppConfig, repositories: Vec<PathBu
             app.spawn_refresh();
         }
 
-        if app.needs_full_redraw {
-            app.needs_full_redraw = false;
-            terminal.clear()?;
+        let notice_expired = app.expire_notice();
+        needs_redraw = needs_redraw || events_applied || notice_expired || app.is_animating();
+
+        if needs_redraw {
+            if app.needs_full_redraw {
+                app.needs_full_redraw = false;
+                terminal.clear()?;
+            }
+            terminal.draw(|frame| draw(frame, app))?;
+            needs_redraw = false;
         }
-        terminal.draw(|frame| draw(frame, &mut app))?;
 
         if !event::poll(Duration::from_millis(TICK_MS))? {
             continue;
@@ -2600,15 +1900,17 @@ pub async fn run(runner: GitRunner, config: &AppConfig, repositories: Vec<PathBu
                 if key.kind == KeyEventKind::Press
                     && app.handle_key(key.code, key.modifiers).await? =>
             {
-                break;
+                return Ok(());
             }
-            Event::Paste(text) => app.handle_paste(&text),
-            Event::Resize(_, _) => {}
+            Event::Key(_) => needs_redraw = true,
+            Event::Paste(text) => {
+                app.handle_paste(&text);
+                needs_redraw = true;
+            }
+            Event::Resize(_, _) => needs_redraw = true,
             _ => {}
         }
     }
-
-    Ok(restore_terminal(terminal)?)
 }
 
 // ── Terminal setup ────────────────────────────────────────────────────────────
@@ -2630,1448 +1932,41 @@ fn restore_terminal(mut terminal: DefaultTerminal) -> io::Result<()> {
     Ok(())
 }
 
-// ── Drawing ───────────────────────────────────────────────────────────────────
+// ── Multi-repo remote-op confirmation copy ────────────────────────────────
 
-fn draw(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
-
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-        draw_too_small(frame, area);
-        return;
-    }
-
-    let layout = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
-
-    draw_title_bar(frame, app, layout[0]);
-    draw_repo_table(frame, app, layout[1]);
-    draw_status_bar(frame, app, layout[2]);
-
-    if app.loading {
-        draw_loading(frame, app, area);
-        return;
-    }
-
-    if app.show_help {
-        draw_help_popup(frame, area, &mut app.help_scroll);
-        return;
-    }
-    {
-        let repo_header = app
-            .repos
-            .get(app.cursor)
-            .map(|r| format!("  {}  {}", r.snapshot.name, r.snapshot.branch.name))
-            .unwrap_or_default();
-        if let Some(panel) = &app.panel {
-            draw_panel_popup(frame, area, panel, &repo_header);
-            return;
-        }
-    }
-    if let Some(p) = &app.confirm_prompt {
-        draw_confirm_popup(frame, area, p);
-        return;
-    }
-    if let Some(p) = &app.auth_prompt {
-        draw_auth_popup(frame, area, p);
-        return;
-    }
-    if let Some(p) = &app.prompt {
-        draw_input_popup(frame, area, p, app.target_count());
+fn confirm_title_for_mode(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Fetch => "Fetch?",
+        Mode::Pull => "Pull?",
+        Mode::Merge => "Merge?",
+        Mode::Rebase => "Rebase?",
+        Mode::Push => "Push?",
     }
 }
 
-fn draw_too_small(frame: &mut Frame, area: Rect) {
-    let msg = Paragraph::new(format!(
-        "Terminal too small  minimum {MIN_WIDTH}×{MIN_HEIGHT}"
-    ))
-    .style(
-        Style::default()
-            .fg(Color::White)
-            .bg(Color::Rgb(150, 20, 20)),
-    )
-    .centered();
-    frame.render_widget(msg, area);
-}
-
-fn draw_loading(frame: &mut Frame, app: &App, area: Rect) {
-    // Dark background
-    frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Rgb(12, 12, 20))),
-        area,
-    );
-
-    let total = app.load_total.max(1);
-    let done = app.load_done;
-    let ratio = done as f64 / total as f64;
-
-    let box_w = 50u16.min(area.width.saturating_sub(4));
-    let box_h = 10u16.min(area.height.saturating_sub(2));
-    let box_area = centered_rect(box_w, box_h, area);
-
-    frame.render_widget(Clear, box_area);
-    frame.render_widget(
-        Block::default()
-            .style(Style::default().bg(C_POPUP_BG))
-            .borders(Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Rounded)
-            .border_style(Style::default().fg(C_POPUP_BORDER)),
-        box_area,
-    );
-
-    let inner = box_area.inner(Margin {
-        horizontal: 2,
-        vertical: 1,
-    });
-    if inner.height < 5 {
-        return;
-    }
-
-    let spinner = SPINNER[(app.tick / 2) as usize % SPINNER.len()];
-    let counter = format!("{done} / {total} repositories");
-
-    let [title_area, _, spin_area, bar_area, count_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
-
-    frame.render_widget(
-        Paragraph::new("  gitbatch").style(
-            Style::default()
-                .fg(C_POPUP_TITLE)
-                .add_modifier(Modifier::BOLD),
-        ),
-        title_area,
-    );
-
-    frame.render_widget(
-        Paragraph::new(format!("  {spinner} Loading repositories…"))
-            .style(Style::default().fg(C_HELP_FG)),
-        spin_area,
-    );
-
-    let gauge = Gauge::default()
-        .ratio(ratio)
-        .label("")
-        .gauge_style(Style::default().fg(C_GAUGE_FG).bg(C_GAUGE_BG));
-    frame.render_widget(gauge, bar_area);
-
-    frame.render_widget(
-        Paragraph::new(format!("  {counter}")).style(Style::default().fg(C_DIM_FG)),
-        count_area,
-    );
-}
-
-fn draw_title_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let queued = app.queued_count();
-    let working = app
-        .repos
-        .iter()
-        .filter(|r| matches!(r.state, RepoOpState::Working))
-        .count();
-    let total_repos = app.repos.len();
-    let sort_label = match app.sort_mode {
-        SortMode::Name => "name",
-        SortMode::Modified => "time",
-    };
-
-    let base = Style::default()
-        .fg(C_TITLE_FG)
-        .bg(C_TITLE_BG)
-        .add_modifier(Modifier::BOLD);
-
-    let left = format!(" gitbatch {}", crate::version::VERSION);
-    let mut right_parts: Vec<Vec<Span>> = vec![vec![Span::raw(format!("repos:{total_repos}"))]];
-    if queued > 0 {
-        right_parts.push(vec![Span::raw(format!("selected:{queued}"))]);
-    }
-    if working > 0 {
-        right_parts.push(vec![Span::raw(format!("working:{working}"))]);
-    }
-    right_parts.push(vec![
-        Span::raw("sor"),
-        Span::styled("t", base.add_modifier(Modifier::UNDERLINED)),
-        Span::raw(format!(":{sort_label}")),
-    ]);
-    if app.worktree_mode {
-        right_parts.push(vec![Span::raw("worktree")]);
-    }
-    right_parts.push(vec![Span::raw(" ?:help ")]);
-
-    let total_w = area.width as usize;
-    let left_w = left.chars().count();
-    let right_w: usize = right_parts
-        .iter()
-        .flatten()
-        .map(|s| s.content.chars().count())
-        .sum::<usize>()
-        + 2 * (right_parts.len() - 1);
-    let gap = total_w.saturating_sub(left_w + right_w);
-
-    let mut spans: Vec<Span> = vec![Span::raw(left), Span::raw(" ".repeat(gap))];
-    for (i, part) in right_parts.into_iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-        }
-        spans.extend(part);
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
-}
-
-/// Shared per-row visuals — style, the cursor/icon/name/stash cell, and the
-/// message text — used by both the repo table and the worktree table.
-fn repo_row_visual(
-    repo: &RepoView,
-    display_name: &str,
-    selected: bool,
-    tick: u64,
-    repo_col_w: u16,
-) -> (Style, Cell<'static>, String) {
-    let dirty = repo.snapshot.dirty;
-    let no_upstream = repo.snapshot.branch.no_upstream;
-    let pull_conflict = repo.snapshot.branch.behind > 0 && !repo.pull_safe;
-    let conflict = repo.snapshot.has_conflicts || pull_conflict;
-    let has_local = !conflict && (repo.snapshot.branch.ahead > 0 || dirty);
-    let style = repo
-        .state
-        .row_style(conflict, has_local, no_upstream, selected);
-    let fetch_spin = repo.fetching && matches!(repo.state, RepoOpState::Idle);
-    let icon = if fetch_spin {
-        SPINNER[(tick / 2) as usize % SPINNER.len()]
-    } else {
-        repo.state
-            .status_icon(conflict, has_local, no_upstream, tick)
-    };
-    // Muted marker for a failed startup fetch — only when nothing more
-    // important occupies the icon column.
-    let fetch_failed = !repo.fetching
-        && repo.fetch_error.is_some()
-        && icon == " "
-        && matches!(repo.state, RepoOpState::Idle);
-    let cursor_sym = if selected { ICON_CURSOR } else { " " };
-    let stash_badge = if repo.snapshot.stash_count > 0 {
-        format!(" {{{}}}", repo.snapshot.stash_count)
-    } else {
-        String::new()
-    };
-    // 4 = cursor(1) + space(1) + icon(1) + space(1)
-    let name_w = repo_col_w.saturating_sub(4 + stash_badge.chars().count() as u16) as usize;
-    let name = truncate(display_name, name_w);
-    let repo_cell: Cell<'static> =
-        if fetch_spin || fetch_failed || (!stash_badge.is_empty() && !selected) {
-            let mut spans: Vec<Span<'static>> = vec![Span::raw(format!("{cursor_sym} "))];
-            if fetch_spin {
-                spans.push(Span::styled(
-                    icon.to_string(),
-                    Style::default().fg(Color::White),
-                ));
-            } else if fetch_failed {
-                spans.push(Span::styled("!", Style::default().fg(C_NET_FG)));
-            } else {
-                spans.push(Span::raw(icon.to_string()));
-            }
-            spans.push(Span::raw(format!(" {name}")));
-            if !stash_badge.is_empty() && !selected {
-                spans.push(Span::styled(stash_badge, Style::default().fg(C_STASH_FG)));
-            } else if !stash_badge.is_empty() {
-                spans.push(Span::raw(stash_badge));
-            }
-            Cell::from(Line::from(spans))
-        } else {
-            Cell::from(format!("{cursor_sym} {icon} {name}{stash_badge}"))
-        };
-    let msg_text = match &repo.state {
-        RepoOpState::Fail { message: m, .. } => m.clone(),
-        _ => repo.snapshot.commit_subject.clone(),
-    };
-    (style, repo_cell, msg_text)
-}
-
-/// Recompute repo-table column widths from current repo/worktree data — an
-/// O(n) scan that formats every branch's ahead/behind counts and every
-/// repo's last-modified age. Called only when `App::col_widths` is
-/// invalidated or the terminal width/mode changed (see `draw_repo_table`),
-/// not on every frame.
-fn compute_col_widths(app: &App, area_width: u16, inner_w: usize, in_wt: bool) -> ColWidths {
-    // ── age column (normal mode, terminal ≥ 112 columns) ─────────────────
-    let show_age = !in_wt && area_width >= 112;
-    let age_col_w: u16 = if show_age {
-        let max_len = app
-            .repos
-            .iter()
-            .map(|r| {
-                r.snapshot
-                    .last_modified
-                    .map(format_age)
-                    .unwrap_or_default()
-                    .chars()
-                    .count()
-            })
-            .max()
-            .unwrap_or(2)
-            .clamp(2, 5) as u16;
-        max_len + 1
-    } else {
-        0
-    };
-
-    // ── column widths ─────────────────────────────────────────────────────
-    let max_name = if in_wt {
-        app.wt_rows
-            .iter()
-            .map(|r| r.display_name.chars().count())
-            .max()
-            .unwrap_or(10)
-    } else {
-        app.repos
-            .iter()
-            .map(|r| r.snapshot.name.chars().count())
-            .max()
-            .unwrap_or(10)
-    }
-    .clamp(8, 36) as u16;
-
-    // Digit count without allocating (unlike `n.to_string().len()`).
-    let digits = |n: u32| n.checked_ilog10().unwrap_or(0) as usize + 1;
-
-    let max_branch = if in_wt {
-        app.wt_rows
-            .iter()
-            .map(|r| r.wt_label.chars().count())
-            .max()
-            .unwrap_or(6)
-    } else {
-        app.repos
-            .iter()
-            .map(|r| {
-                let b = &r.snapshot.branch;
-                let mut len = b.name.chars().count();
-                if b.ahead > 0 {
-                    len += 1 + 1 + digits(b.ahead);
-                }
-                if b.behind > 0 {
-                    len += 1 + 1 + digits(b.behind);
-                }
-                len
-            })
-            .max()
-            .unwrap_or(6)
-    }
-    .clamp(6, 28) as u16;
-
-    let repo_col_w = (max_name + 4).min(inner_w as u16 / 3);
-    let branch_col_w = (max_branch + 1).min(inner_w as u16 / 4);
-
-    ColWidths {
-        area_width,
-        in_wt,
-        repo_col_w,
-        branch_col_w,
-        age_col_w,
-        show_age,
+fn confirm_subject_for_mode(mode: Mode, count: usize) -> String {
+    match mode {
+        Mode::Push => format!("Push to {count} remotes"),
+        Mode::Fetch => format!("Fetch {count} repositories"),
+        Mode::Pull => format!("Pull {count} repositories"),
+        Mode::Merge => format!("Merge {count} repositories"),
+        Mode::Rebase => format!("Rebase {count} repositories"),
     }
 }
 
-fn draw_repo_table(frame: &mut Frame, app: &mut App, area: Rect) {
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let in_wt = app.worktree_mode;
-
-    // Reuse cached column widths unless the cache was invalidated by new
-    // repo/worktree data (see `apply_bg_event`) or the width/mode changed —
-    // recomputing is an O(n) scan and `draw` runs on every 80ms tick.
-    if app
-        .col_widths
-        .is_none_or(|c| c.area_width != area.width || c.in_wt != in_wt)
-    {
-        app.col_widths = Some(compute_col_widths(app, area.width, inner_w, in_wt));
-    }
-    let ColWidths {
-        repo_col_w,
-        branch_col_w,
-        age_col_w,
-        show_age,
-        ..
-    } = app.col_widths.expect("populated above");
-
-    // A header row costs one more line than the borders alone; skip it on
-    // very short terminals so every row still goes to data.
-    let show_header = area.height >= 10;
-    let viewport_h = area.height.saturating_sub(if show_header { 3 } else { 2 }) as usize;
-
-    // ── update scroll offset ──────────────────────────────────────────────
-    let (cursor, total) = if in_wt {
-        (app.wt_cursor, app.wt_rows.len())
-    } else {
-        (app.cursor, app.repos.len())
-    };
-    if total > 0 {
-        if in_wt {
-            if cursor < app.wt_offset {
-                app.wt_offset = cursor;
-            } else if viewport_h > 0 && cursor >= app.wt_offset + viewport_h {
-                app.wt_offset = cursor + 1 - viewport_h;
-            }
-            app.wt_offset = app.wt_offset.min(total.saturating_sub(viewport_h));
-        } else {
-            if cursor < app.table_offset {
-                app.table_offset = cursor;
-            } else if viewport_h > 0 && cursor >= app.table_offset + viewport_h {
-                app.table_offset = cursor + 1 - viewport_h;
-            }
-            app.table_offset = app.table_offset.min(total.saturating_sub(viewport_h));
-        }
-    }
-    let visible_start = if in_wt {
-        app.wt_offset
-    } else {
-        app.table_offset
-    };
-    let visible_end = (visible_start + viewport_h).min(total);
-
-    let msg_col_w = (inner_w as u16)
-        .saturating_sub(repo_col_w + branch_col_w + age_col_w)
-        .max(8) as usize;
-
-    let mut widths: Vec<Constraint> = vec![
-        Constraint::Length(repo_col_w),
-        Constraint::Length(branch_col_w),
-        Constraint::Fill(1),
-    ];
-    if show_age {
-        widths.push(Constraint::Length(age_col_w));
-    }
-
-    // Capture scalars before row-building closures (avoids re-borrowing app)
-    let msg_scroll = app.msg_scroll;
-    let tick = app.tick;
-
-    let rows: Vec<Row<'static>> = if in_wt {
-        app.wt_rows[visible_start..visible_end]
-            .iter()
-            .enumerate()
-            .map(|(vi, wt_row)| {
-                let i = visible_start + vi;
-                let selected = i == app.wt_cursor;
-                let repo = &app.repos[wt_row.repo_idx];
-                let (style, repo_cell, msg_text) =
-                    repo_row_visual(repo, &wt_row.display_name, selected, tick, repo_col_w);
-                let label = truncate(&wt_row.wt_label, branch_col_w as usize);
-                let msg = truncate(&msg_text, msg_col_w);
-                Row::new([repo_cell, Cell::from(label), Cell::from(msg)]).style(style)
-            })
-            .collect()
-    } else {
-        app.repos[visible_start..visible_end]
-            .iter()
-            .enumerate()
-            .map(|(vi, repo)| {
-                let i = visible_start + vi;
-                let selected = i == app.cursor;
-                let (style, repo_cell, msg_text) =
-                    repo_row_visual(repo, &repo.snapshot.name, selected, tick, repo_col_w);
-
-                let branch_cell: Cell<'static> =
-                    Cell::from(truncate(&repo.branch_display(), branch_col_w as usize));
-
-                // Message with horizontal scroll
-                let scrolled: String = if msg_scroll > 0 {
-                    msg_text.chars().skip(msg_scroll).collect()
-                } else {
-                    msg_text
-                };
-                let msg = truncate(&scrolled, msg_col_w);
-
-                let mut cells: Vec<Cell<'static>> = vec![repo_cell, branch_cell, Cell::from(msg)];
-                if show_age {
-                    let age = repo
-                        .snapshot
-                        .last_modified
-                        .map(format_age)
-                        .unwrap_or_default();
-                    cells.push(Cell::from(age).style(if selected {
-                        Style::default()
-                    } else {
-                        Style::default().fg(C_AGE_FG)
-                    }));
-                }
-                Row::new(cells).style(style)
-            })
-            .collect()
-    };
-
-    let dim = Style::default().fg(C_DIM_FG);
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(C_BORDER));
-
-    if visible_start > 0 {
-        block = block.title_top(Line::from(Span::styled(" more above ", dim)).centered());
-    }
-    if visible_end < total {
-        block = block.title_bottom(Line::from(Span::styled(" more below ", dim)).centered());
-    }
-
-    let mut table = Table::new(rows, widths)
-        .block(block)
-        .row_highlight_style(Style::default());
-    if show_header {
-        let mut header_cells = vec![
-            // The repo cell is "<cursor> <icon> <name>" (see `repo_row_visual`) —
-            // a 4-char prefix before the name starts. Indent the label to match.
-            Cell::from("    repo"),
-            Cell::from(if in_wt { "worktree" } else { "branch" }),
-            Cell::from("message"),
-        ];
-        if show_age {
-            header_cells.push(Cell::from("age"));
-        }
-        table = table.header(Row::new(header_cells).style(dim));
-    }
-    frame.render_widget(table, area);
-}
-
-/// Pick the widest of `tiers` (ordered full → short → minimal) whose width
-/// still leaves the status bar's center status at least `STATUS_CENTER_FLOOR`
-/// columns, given the total bar width and the mode badge's width. Falls back
-/// to the last (shortest) tier if none fit — the caller then simply gets a
-/// squeezed or empty center rather than a hint clipped mid-word.
-fn fit_hint(tiers: [&str; 3], total_w: usize, mode_w: usize) -> &str {
-    for tier in tiers {
-        let right_w = tier.chars().count();
-        if total_w.saturating_sub(mode_w + right_w) >= STATUS_CENTER_FLOOR {
-            return tier;
-        }
-    }
-    tiers[tiers.len() - 1]
-}
-
-fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let (mode_bg, mode_fg, mode_sym) = match app.mode {
-        Mode::Pull => (C_MODE_PULL_BG, C_MODE_LIGHT_FG, SYM_PULL),
-        Mode::Merge => (C_MODE_MERGE_BG, C_MODE_LIGHT_FG, SYM_MERGE),
-        Mode::Rebase => (C_MODE_REBASE_BG, C_MODE_LIGHT_FG, SYM_REBASE),
-        Mode::Push => (C_MODE_PUSH_BG, C_MODE_DARK_FG, SYM_PUSH),
-        Mode::Fetch => (C_MODE_FETCH_BG, C_MODE_LIGHT_FG, SYM_FETCH),
-    };
-
-    let mode_str = format!(" {mode_sym} {} ", app.mode.as_str().to_uppercase());
-    let mode_w = mode_str.chars().count();
-
-    let center = if let Some(repo) = app.repos.get(app.cursor) {
-        match &repo.state {
-            RepoOpState::Success(m) => format!(" ✓ {m}"),
-            RepoOpState::Fail { message: m, .. } => format!(" ✗ {m}"),
-            RepoOpState::Working => format!(" {} working…", repo.snapshot.name),
-            _ => {
-                let b = &repo.snapshot.branch;
-                let mut s = format!(" {}  {}", repo.snapshot.name, b.name);
-                if b.no_upstream {
-                    s.push_str("  no upstream");
-                } else {
-                    if b.ahead > 0 {
-                        let _ = write!(s, " {}{}", ICON_AHEAD, b.ahead);
-                    }
-                    if b.behind > 0 {
-                        let _ = write!(s, " {}{}", ICON_BEHIND, b.behind);
-                    }
-                }
-                let pull_conflict = b.behind > 0 && !repo.pull_safe;
-                if repo.snapshot.has_conflicts {
-                    s.push_str("  merge conflict");
-                } else if pull_conflict && b.ahead > 0 {
-                    s.push_str("  conflict");
-                } else if pull_conflict {
-                    s.push_str("  would conflict");
-                } else if repo.snapshot.dirty {
-                    s.push_str("  dirty");
-                }
-                if repo.snapshot.stash_count > 0 {
-                    let _ = write!(s, "  {{{}}}", repo.snapshot.stash_count);
-                }
-                if repo.fetch_error.is_some() {
-                    s.push_str("  ⚠ auto-fetch failed");
-                }
-                s
-            }
-        }
-    } else {
-        " no repositories".into()
-    };
-
-    let total_w = area.width as usize;
-    let right: &str = if app.worktree_mode {
-        fit_hint(
-            [
-                "  n:new  d:rm  L:lock  X:prune  W:exit ",
-                "  n/d/L/X  W:exit ",
-                "  ?:help ",
-            ],
-            total_w,
-            mode_w,
-        )
-    } else if let Some(panel) = &app.panel {
-        match panel.kind {
-            PanelKind::Branches => fit_hint(
-                [
-                    "  j/k:nav  space:checkout  n:new  d/D:del  Esc:close ",
-                    "  j/k  space:co  d/D  Esc ",
-                    "  ?:help ",
-                ],
-                total_w,
-                mode_w,
-            ),
-            _ => fit_hint(
-                ["  j/k:scroll  Esc:close ", "  j/k  Esc ", "  ?:help "],
-                total_w,
-                mode_w,
-            ),
-        }
-    } else if let Some(repo) = app.repos.get(app.cursor) {
-        match &repo.state {
-            RepoOpState::Success(_) | RepoOpState::Fail { .. } => {
-                fit_hint(["  c/Esc:clear ", "  c/Esc ", "  ?:help "], total_w, mode_w)
-            }
-            RepoOpState::Working => fit_hint(
-                ["  working… ", "  working… ", "  working… "],
-                total_w,
-                mode_w,
-            ),
-            _ if repo.snapshot.dirty => fit_hint(
-                [
-                    "  c:commit  S:stash  TAB:lazygit ",
-                    "  c  S  TAB ",
-                    "  ?:help ",
-                ],
-                total_w,
-                mode_w,
-            ),
-            _ if repo.snapshot.branch.behind > 0 => fit_hint(
-                [
-                    "  p:pull  f:fetch  TAB:lazygit ",
-                    "  p  f  TAB ",
-                    "  ?:help ",
-                ],
-                total_w,
-                mode_w,
-            ),
-            _ if repo.snapshot.branch.ahead > 0 => fit_hint(
-                ["  P:push  TAB:lazygit ", "  P  TAB ", "  ?:help "],
-                total_w,
-                mode_w,
-            ),
-            _ => fit_hint(
-                ["  m:mode  TAB:lazygit ", "  m  TAB ", "  ?:help "],
-                total_w,
-                mode_w,
-            ),
-        }
-    } else {
-        fit_hint(["  m:mode ", "  m:mode ", "  ?:help "], total_w, mode_w)
-    };
-    let right_w = right.chars().count();
-    let center_w = total_w.saturating_sub(mode_w + right_w);
-    let center_trimmed = truncate(&center, center_w.saturating_sub(1));
-    let pad = center_w.saturating_sub(center_trimmed.chars().count() + 1);
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                &mode_str,
-                Style::default()
-                    .fg(mode_fg)
-                    .bg(mode_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!("{}{}", center_trimmed, " ".repeat(pad))),
-            Span::styled(right, Style::default().fg(C_HELP_FG)),
-        ])),
-        area,
-    );
-}
-
-// ── Popup helpers ─────────────────────────────────────────────────────────────
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect::new(x, y, width.min(area.width), height.min(area.height))
-}
-
-fn popup_block(title: &str) -> Block<'_> {
-    Block::default()
-        .style(Style::default().bg(C_POPUP_BG))
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(C_POPUP_BORDER))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default()
-                .fg(C_POPUP_TITLE)
-                .add_modifier(Modifier::BOLD),
-        ))
-}
-
-fn section_line(label: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        label.to_string(),
-        Style::default()
-            .fg(C_SECTION_HDR)
-            .add_modifier(Modifier::BOLD),
-    ))
-}
-
-fn kv_line<'a>(key: &'a str, desc: &'a str) -> Line<'a> {
-    Line::from(vec![
-        Span::styled(
-            format!("  {key:<12}"),
-            Style::default().fg(C_KEY_FG).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(desc, Style::default().fg(Color::White)),
-    ])
-}
-
-fn icon_kv_line(glyph: &'static str, desc: &'static str, color: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("  {glyph:<12}"),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(desc, Style::default().fg(Color::White)),
-    ])
-}
-
-fn draw_help_popup(frame: &mut Frame, area: Rect, scroll: &mut usize) {
-    let popup_w = 78u16.min(area.width.saturating_sub(4));
-    let popup_h = 35u16.min(area.height.saturating_sub(2));
-    let popup_area = centered_rect(popup_w, popup_h, area);
-
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(popup_block("Help"), popup_area);
-
-    let inner = popup_area.inner(Margin {
-        horizontal: 2,
-        vertical: 1,
-    });
-    if inner.width < 20 || inner.height < 3 {
-        return;
-    }
-
-    const KEYS_H: u16 = 23;
-    const ICONS_H: u16 = 10;
-
-    let left_lines = vec![
-        section_line("Navigation"),
-        kv_line("j/k ↑↓", "move cursor"),
-        kv_line("g/G", "top / bottom"),
-        kv_line("PgUp/PgDn", "jump page"),
-        kv_line("← / →", "scroll message"),
-        Line::from(""),
-        section_line("Git"),
-        kv_line("f", "fetch"),
-        kv_line("p", "pull"),
-        kv_line("P", "push"),
-        kv_line("m", "cycle mode"),
-        Line::from(""),
-        section_line("Local"),
-        kv_line("c", "commit"),
-        kv_line("n", "new branch"),
-        kv_line("u", "set upstream"),
-        kv_line("U", "reset to upstream"),
-        kv_line("S / O / D", "stash/pop/drop"),
-        Line::from(""),
-        section_line("Worktrees (W toggles)"),
-        kv_line("n / d", "new / remove"),
-        kv_line("L / X", "lock / prune"),
-    ];
-
-    let right_lines = vec![
-        section_line("Batch (tag to apply to all)"),
-        kv_line("Space", "tag / untag repo"),
-        kv_line("a / A", "tag all / clear all"),
-        kv_line("Enter", "run mode on tagged"),
-        kv_line("", "all actions apply to"),
-        kv_line("", "tagged repos when set"),
-        section_line("Panels"),
-        kv_line("b", "branches"),
-        kv_line("s", "status"),
-        kv_line("v", "commits"),
-        kv_line("q / Esc", "close panel"),
-        Line::from(""),
-        section_line("Other"),
-        kv_line("t", "toggle sort"),
-        kv_line("TAB", "lazygit"),
-        kv_line("q / Ctrl+C", "quit"),
-    ];
-
-    // Status icons legend — full-width section below the keybindings.
-    let icon_lines = vec![
-        section_line("Status Icons"),
-        icon_kv_line(
-            ICON_CONFLICT,
-            "conflict — active merge conflict, or pull would create conflicts",
-            C_CONFLICT_FG,
-        ),
-        icon_kv_line(
-            ICON_LOCAL,
-            "local — uncommitted/unpushed changes, safe to pull",
-            C_LOCAL_FG,
-        ),
-        icon_kv_line(
-            ICON_AHEAD,
-            "ahead — branch is ahead of its remote",
-            C_AHEAD_FG,
-        ),
-        icon_kv_line(
-            ICON_BEHIND,
-            "behind — branch is behind its remote",
-            C_BEHIND_FG,
-        ),
-        icon_kv_line(
-            ICON_QUEUED,
-            "queued — selected for batch operation",
-            C_QUEUED_FG,
-        ),
-        icon_kv_line(ICON_SUCCESS, "ok — last operation succeeded", C_SUCCESS_FG),
-        icon_kv_line(
-            ICON_FAIL,
-            "failed — last operation failed (gray: network error)",
-            C_FAIL_FG,
-        ),
-        icon_kv_line(
-            "?  /  !",
-            "failed — credentials needed / push rejected (non-FF)",
-            C_CREDS_FG,
-        ),
-        icon_kv_line("{N}", "stash — repo has N stashed changesets", C_STASH_FG),
-    ];
-
-    if inner.height >= KEYS_H + ICONS_H {
-        // Tall terminal: two keybinding columns with the legend below.
-        *scroll = 0;
-        let [keys_area, icons_area] =
-            Layout::vertical([Constraint::Length(KEYS_H), Constraint::Fill(1)]).areas(inner);
-        let half = keys_area.width / 2;
-        let [left_area, right_area] =
-            Layout::horizontal([Constraint::Length(half), Constraint::Fill(1)]).areas(keys_area);
-        frame.render_widget(Paragraph::new(left_lines), left_area);
-        frame.render_widget(Paragraph::new(right_lines), right_area);
-        frame.render_widget(Paragraph::new(icon_lines), icons_area);
-        return;
-    }
-
-    // Short terminal: flatten everything into one scrollable column.
-    let mut flat: Vec<Line> = left_lines;
-    flat.push(Line::from(""));
-    flat.extend(right_lines);
-    flat.push(Line::from(""));
-    flat.extend(icon_lines);
-
-    let visible = inner.height as usize;
-    *scroll = (*scroll).min(flat.len().saturating_sub(visible));
-    let start = *scroll;
-    let end = (start + visible).min(flat.len());
-
-    let dim = Style::default().fg(C_DIM_FG);
-    let mut lines: Vec<Line> = Vec::with_capacity(visible);
-    if start > 0 {
-        lines.push(Line::from(Span::styled("  ↑ more above (k)", dim)));
-    }
-    let body_start = start + usize::from(start > 0);
-    let more_below = end < flat.len();
-    let body_end = end - usize::from(more_below);
-    lines.extend(flat[body_start..body_end].iter().cloned());
-    if more_below {
-        lines.push(Line::from(Span::styled("  ↓ more below (j)", dim)));
-    }
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
-fn draw_panel_popup(frame: &mut Frame, area: Rect, panel: &PanelState, repo_header: &str) {
-    let popup_w = (area.width * 3 / 4)
-        .clamp(50, 120)
-        .min(area.width.saturating_sub(4));
-    let popup_h = (area.height * 4 / 5)
-        .clamp(12, 60)
-        .min(area.height.saturating_sub(2));
-    let popup_area = centered_rect(popup_w, popup_h, area);
-
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(popup_block(&panel.title), popup_area);
-
-    let inner = popup_area.inner(Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
-
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            repo_header,
-            Style::default()
-                .fg(C_BRANCH_CUR)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Rect { height: 1, ..inner },
-    );
-
-    // Hint line
-    let hint = match panel.kind {
-        PanelKind::Branches => Line::from(vec![
-            key_span("j/k"),
-            plain(" navigate  "),
-            key_span("space/c"),
-            plain(" checkout  "),
-            key_span("n"),
-            plain(" new  "),
-            key_span("d"),
-            plain(" delete  "),
-            key_span("D"),
-            plain(" force-del  "),
-            key_span("Esc"),
-            plain(" close"),
-        ]),
-        _ => Line::from(vec![
-            key_span("j/k"),
-            plain(" scroll  "),
-            key_span("Esc"),
-            plain(" close"),
-        ]),
-    };
-    frame.render_widget(
-        Paragraph::new(hint).style(Style::default().fg(C_HELP_FG)),
-        Rect {
-            y: inner.y + 1,
-            height: 1,
-            ..inner
-        },
-    );
-
-    // Content area
-    let body = Rect {
-        y: inner.y + 3,
-        height: inner.height.saturating_sub(3),
-        ..inner
-    };
-    let visible_h = body.height as usize;
-    let start = panel.scroll;
-    let end = (start + visible_h).min(panel.lines.len());
-
-    let mut lines: Vec<Line> = Vec::new();
-    if start > 0 {
-        lines.push(Line::from(Span::styled(
-            "  ↑ more above",
-            Style::default().fg(C_DIM_FG),
-        )));
-    }
-    for (i, line) in panel.lines[start..end].iter().enumerate() {
-        let idx = start + i;
-        if panel.is_navigable() && idx == panel.cursor {
-            lines.push(Line::from(Span::styled(
-                format!("▶ {line}"),
-                Style::default()
-                    .fg(Color::White)
-                    .bg(C_SEL_DEFAULT_BG)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        } else if line.trim_start().starts_with('*') {
-            lines.push(Line::from(Span::styled(
-                line.as_str(),
-                Style::default()
-                    .fg(C_BRANCH_CUR)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        } else {
-            lines.push(Line::from(line.as_str()));
-        }
-    }
-    if end < panel.lines.len() {
-        lines.push(Line::from(Span::styled(
-            "  ↓ more below",
-            Style::default().fg(C_DIM_FG),
-        )));
-    }
-
-    frame.render_widget(Paragraph::new(lines), body);
-}
-
-fn draw_confirm_popup(frame: &mut Frame, area: Rect, prompt: &ConfirmPromptState) {
-    let popup_w = 60u16.min(area.width.saturating_sub(4));
-    let popup_h = 8u16;
-    let popup_area = centered_rect(popup_w, popup_h, area);
-
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(popup_block(prompt.title), popup_area);
-
-    let inner = popup_area.inner(Margin {
-        horizontal: 2,
-        vertical: 1,
-    });
-
-    let lines = vec![
-        Line::from(Span::styled(
-            prompt.subject.as_str(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            prompt.warning.as_str(),
-            Style::default().fg(C_FAIL_FG),
-        )),
-        Line::from(""),
-        {
-            let mut hint = vec![key_span("y / Enter")];
-            if matches!(prompt.action, ConfirmAction::ResetToUpstream { .. }) {
-                hint.push(plain("  mixed reset    "));
-                hint.push(key_span("H"));
-                hint.push(plain("  hard reset    "));
-            } else {
-                hint.push(plain("  confirm    "));
-            }
-            hint.push(key_span("n / Esc"));
-            hint.push(plain("  cancel"));
-            Line::from(hint)
-        },
-    ];
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
-fn draw_auth_popup(frame: &mut Frame, area: Rect, prompt: &AuthPromptState) {
-    let popup_w = 58u16.min(area.width.saturating_sub(4));
-    let popup_h = 11u16;
-    let popup_area = centered_rect(popup_w, popup_h, area);
-
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(popup_block("Credentials Required"), popup_area);
-
-    let inner = popup_area.inner(Margin {
-        horizontal: 2,
-        vertical: 1,
-    });
-    let repo = prompt.repo_name.as_deref().unwrap_or("?");
-
-    let active = Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
-    let inactive = Style::default().fg(C_HELP_FG);
-
-    let user_style = if prompt.field == CredentialField::Username {
-        active
-    } else {
-        inactive
-    };
-    let pass_style = if prompt.field == CredentialField::Password {
-        active
-    } else {
-        inactive
-    };
-
-    let user_val = if prompt.field == CredentialField::Username {
-        format!("{}_", prompt.input)
-    } else {
-        prompt.username.clone()
-    };
-    let pass_val = if prompt.field == CredentialField::Password {
-        "•".repeat(prompt.input.chars().count()) + "_"
-    } else {
-        "•".repeat(prompt.password.chars().count())
-    };
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("Repository: ", Style::default().fg(C_HELP_FG)),
-            Span::styled(
-                repo,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Username  ", Style::default().fg(C_HELP_FG)),
-            Span::styled(&user_val, user_style),
-        ]),
-        Line::from(vec![
-            Span::styled("  Password  ", Style::default().fg(C_HELP_FG)),
-            Span::styled(&pass_val, pass_style),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            key_span("Tab"),
-            plain(" switch  "),
-            key_span("Enter"),
-            plain(" submit  "),
-            key_span("Esc"),
-            plain(" cancel"),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
-fn draw_input_popup(frame: &mut Frame, area: Rect, prompt: &PromptState, target_count: usize) {
-    let is_commit = prompt.kind == PromptKind::Commit;
-    let popup_w = 64u16.min(area.width.saturating_sub(4));
-    let popup_h = if is_commit { 14u16 } else { 7u16 };
-    let popup_area = centered_rect(popup_w, popup_h, area);
-
-    frame.render_widget(Clear, popup_area);
-    let title = if target_count > 1 {
-        format!("{} — {} repos", prompt.kind.title(), target_count)
-    } else {
-        prompt.kind.title().to_string()
-    };
-    frame.render_widget(popup_block(&title), popup_area);
-
-    let inner = popup_area.inner(Margin {
-        horizontal: 2,
-        vertical: 1,
-    });
-    let active = Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
-    let inactive = Style::default().fg(C_HELP_FG);
-
-    if is_commit {
-        let subj_active = prompt.commit_field == CommitField::Subject;
-        let subj_indicator = if subj_active { ">" } else { " " };
-        let desc_indicator = if subj_active { " " } else { ">" };
-        let subj_style = if subj_active { active } else { inactive };
-        let desc_style = if subj_active { inactive } else { active };
-
-        let subj_spans = if subj_active {
-            cursor_spans(&prompt.input, prompt.cursor, subj_style)
-        } else {
-            vec![Span::styled(prompt.input.clone(), subj_style)]
-        };
-
-        // Show up to 4 visible description lines.
-        let desc_text = if !subj_active {
-            format!("{}_", prompt.description)
-        } else {
-            prompt.description.clone()
-        };
-        let desc_lines: Vec<&str> = if desc_text.is_empty() {
-            vec![""]
-        } else {
-            let all: Vec<&str> = desc_text.lines().collect();
-            let max_visible = 4;
-            if all.len() > max_visible {
-                all[all.len() - max_visible..].to_vec()
-            } else {
-                all
-            }
-        };
-
-        let mut subj_line = vec![
-            Span::styled(
-                format!("{subj_indicator} "),
-                Style::default().fg(C_SECTION_HDR),
-            ),
-            Span::styled("Summary:     ", Style::default().fg(C_SECTION_HDR)),
-        ];
-        subj_line.extend(subj_spans);
-        let mut lines: Vec<Line> = vec![
-            Line::from(subj_line),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    format!("{desc_indicator} "),
-                    Style::default().fg(C_SECTION_HDR),
-                ),
-                Span::styled("Description:", Style::default().fg(C_SECTION_HDR)),
-            ]),
-        ];
-        for dl in &desc_lines {
-            lines.push(Line::from(Span::styled(format!("  {dl}"), desc_style)));
-        }
-        // Pad to keep the hint line at a stable position.
-        for _ in desc_lines.len()..4 {
-            lines.push(Line::from(""));
-        }
-        lines.push(Line::from(""));
-        if subj_active {
-            lines.push(Line::from(vec![
-                key_span("Enter"),
-                plain(" commit  "),
-                key_span("Tab"),
-                plain(" description  "),
-                key_span("Esc"),
-                plain(" cancel"),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                key_span("Tab"),
-                plain(" summary  "),
-                key_span("Esc"),
-                plain(" cancel"),
-            ]));
-        }
-        frame.render_widget(Paragraph::new(lines), inner);
-    } else {
-        let mut input_line = vec![Span::styled("> ", active)];
-        input_line.extend(cursor_spans(&prompt.input, prompt.cursor, active));
-        let error_line = match prompt.error {
-            Some(e) => Line::from(Span::styled(e, Style::default().fg(C_FAIL_FG))),
-            None => Line::from(""),
-        };
-        let lines = vec![
-            Line::from(Span::styled(
-                prompt.kind.label(),
-                Style::default().fg(C_SECTION_HDR),
-            )),
-            Line::from(Span::styled(
-                "─".repeat(inner.width as usize),
-                Style::default().fg(C_BORDER),
-            )),
-            Line::from(""),
-            Line::from(input_line),
-            error_line,
-            Line::from(vec![
-                key_span("Enter"),
-                plain(" confirm  "),
-                key_span("Esc"),
-                plain(" cancel"),
-            ]),
-        ];
-        frame.render_widget(Paragraph::new(lines), inner);
-    }
-}
-
-/// Render `input` with a reversed-video cursor at byte offset `cursor`.
-fn cursor_spans(input: &str, cursor: usize, style: Style) -> Vec<Span<'static>> {
-    let cursor = cursor.min(input.len());
-    let (before, after) = input.split_at(cursor);
-    let mut spans = vec![Span::styled(before.to_string(), style)];
-    match after.chars().next() {
-        Some(c) => {
-            spans.push(Span::styled(
-                c.to_string(),
-                style.add_modifier(Modifier::REVERSED),
-            ));
-            spans.push(Span::styled(after[c.len_utf8()..].to_string(), style));
-        }
-        None => spans.push(Span::styled(" ", style.add_modifier(Modifier::REVERSED))),
-    }
-    spans
-}
-
-// ── Style helpers ─────────────────────────────────────────────────────────────
-
-fn key_span(s: &str) -> Span<'_> {
-    Span::styled(
-        s,
-        Style::default().fg(C_KEY_FG).add_modifier(Modifier::BOLD),
-    )
-}
-
-fn plain(s: &str) -> Span<'_> {
-    Span::styled(s, Style::default().fg(C_HELP_FG))
-}
-
-fn format_age(t: SystemTime) -> String {
-    let secs = SystemTime::now()
-        .duration_since(t)
-        .unwrap_or_default()
-        .as_secs();
-    match secs {
-        s if s < 60 => format!("{s}s"),
-        s if s < 3_600 => format!("{}m", s / 60),
-        s if s < 86_400 => format!("{}h", s / 3_600),
-        s if s < 7 * 86_400 => format!("{}d", s / 86_400),
-        s if s < 30 * 86_400 => format!("{}w", s / (7 * 86_400)),
-        s if s < 365 * 86_400 => format!("{}mo", s / (30 * 86_400)),
-        s => format!("{}y", s / (365 * 86_400)),
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    let count = s.chars().count();
-    if count <= max {
-        s.to_string()
-    } else if max <= 1 {
-        s.chars().take(max).collect()
-    } else {
-        let mut out: String = s.chars().take(max - 1).collect();
-        out.push('…');
-        out
-    }
-}
-
-// ── Worktree helpers ──────────────────────────────────────────────────────────
-
-struct WorktreeContext {
-    primary_path: PathBuf,
-    selected_is_primary: bool,
-    selected_is_locked: bool,
-}
-
-async fn worktree_context(runner: &GitRunner, selected: &Path) -> Result<WorktreeContext> {
-    let listing = runner.worktree_list(selected).await?;
-    let selected_norm = normalize_path(selected);
-    let mut primary_path = selected.to_path_buf();
-    let mut current_path: Option<PathBuf> = None;
-    let mut selected_is_locked = false;
-    let mut first = true;
-
-    for line in listing.lines() {
-        if let Some(path_str) = line.strip_prefix("worktree ") {
-            let path = PathBuf::from(path_str);
-            if first {
-                primary_path = path.clone();
-                first = false;
-            }
-            current_path = Some(path);
-        } else if line.trim() == "locked"
-            && current_path
-                .as_ref()
-                .is_some_and(|p| normalize_path(p) == selected_norm)
-        {
-            selected_is_locked = true;
-        }
-    }
-
-    let selected_is_primary = normalize_path(&primary_path) == selected_norm;
-
-    Ok(WorktreeContext {
-        primary_path,
-        selected_is_primary,
-        selected_is_locked,
-    })
-}
-
-fn normalize_path(path: &Path) -> String {
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn default_worktree_path(repo_path: &Path, branch: &str) -> PathBuf {
-    let repo_name = repo_path
-        .file_name()
-        .map_or_else(|| "worktree".into(), |n| n.to_string_lossy().into_owned());
-    let sanitized: String = branch
-        .chars()
-        .map(|c| match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' => c,
-            _ => '-',
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    repo_path
-        .parent()
-        .unwrap_or(repo_path)
-        .join(format!("{repo_name}.{sanitized}"))
-}
-
-fn display_action(action: &RemoteAction) -> &'static str {
-    match action {
-        RemoteAction::Fetch => "fetch",
-        RemoteAction::PullFfOnly => "pull (ff-only)",
-        RemoteAction::Merge => "merge",
-        RemoteAction::Rebase => "rebase",
-        RemoteAction::Push { force: true } => "force push",
-        RemoteAction::Push { force: false } => "push",
+fn confirm_warning_for_mode(mode: Mode) -> String {
+    match mode {
+        Mode::Fetch => "Read-only, but reaches out to every remote below.".into(),
+        Mode::Pull => "Fast-forwards every repo below from its remote.".into(),
+        Mode::Merge => "Merges the upstream branch into every repo below.".into(),
+        Mode::Rebase => "Rewrites local history in every repo below.".into(),
+        Mode::Push => "Pushes local commits to every remote below.".into(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn filter_tracked_remotes_drops_only_tracked_remote_rows() {
-        let sha = "a".repeat(40);
-        let output = [
-            // tracked, plain bracket
-            format!("* main                {sha} [origin/main] tip"),
-            // tracked with counts
-            format!("  feature             {sha} [origin/feature: ahead 1, behind 2] wip"),
-            // upstream gone — remote row doesn't exist anyway, must not panic
-            format!("  stale               {sha} [origin/stale: gone] old"),
-            // local without upstream
-            format!("  local-only          {sha} no upstream here"),
-            // symbolic ref line is kept
-            "  remotes/origin/HEAD -> origin/main".to_string(),
-            // tracked by the locals above → dropped
-            format!("  remotes/origin/main {sha} tip"),
-            format!("  remotes/origin/feature {sha} wip"),
-            // remote-only branch → kept
-            format!("  remotes/origin/other {sha} other work"),
-        ]
-        .join("\n");
-
-        let filtered = filter_tracked_remotes(&output);
-        assert!(filtered.contains("* main"));
-        assert!(filtered.contains("  feature"));
-        assert!(filtered.contains("  stale"));
-        assert!(filtered.contains("local-only"));
-        assert!(filtered.contains("remotes/origin/HEAD -> origin/main"));
-        assert!(!filtered.contains("remotes/origin/main"));
-        assert!(!filtered.contains("remotes/origin/feature"));
-        assert!(filtered.contains("remotes/origin/other"));
-    }
-
-    #[test]
-    fn validate_branch_name_accepts_normal_names() {
-        for name in ["main", "feature/foo", "release-1.2", "hotfix_x", "a/b/c"] {
-            assert!(validate_branch_name(name).is_ok(), "{name}");
-        }
-    }
-
-    #[test]
-    fn validate_branch_name_rejects_invalid_names() {
-        for name in [
-            "",
-            "@",
-            "-x",
-            "a b",
-            "a..b",
-            "a.",
-            "/a",
-            "a/",
-            "a//b",
-            "a@{b",
-            "a~b",
-            "a^b",
-            "a:b",
-            "a?b",
-            "a*b",
-            "a[b",
-            "a\\b",
-            ".hidden",
-            "a/.hidden",
-            "a.lock",
-            "a/b.lock",
-            "a\tb",
-        ] {
-            assert!(validate_branch_name(name).is_err(), "{name}");
-        }
-    }
-
-    #[test]
-    fn word_back_start_deletes_segment_wise() {
-        let s = "feat/my-branch";
-        // From the end: deletes "branch".
-        assert_eq!(word_back_start(s, s.len()), "feat/my-".len());
-        // From "feat/my-": skips the '-' separator and deletes "my".
-        assert_eq!(word_back_start(s, "feat/my-".len()), "feat/".len());
-        // From "feat/": deletes everything back to the start.
-        assert_eq!(word_back_start(s, "feat/".len()), 0);
-        assert_eq!(word_back_start("", 0), 0);
-    }
 
     fn git_err(output: &str) -> crate::error::AppError {
         crate::error::AppError::GitCommandFailed {
@@ -4119,6 +2014,94 @@ mod tests {
         }
     }
 
+    fn test_repo_view(name: &str, dirty: bool) -> RepoView {
+        RepoView::new(RepositorySnapshot {
+            path: PathBuf::from(name),
+            name: name.to_string(),
+            branch: crate::git::BranchStatus::default(),
+            dirty,
+            has_conflicts: false,
+            last_modified: None,
+            commit_subject: String::new(),
+            stash_count: 0,
+        })
+    }
+
+    #[test]
+    fn target_paths_where_is_empty_when_selected_repos_fail_keep() {
+        let mut app = App::new(GitRunner::default(), Mode::Pull, false, 0);
+        app.loading = false;
+
+        let mut a = test_repo_view("a-clean-selected", false);
+        a.state = RepoOpState::Queued(QueueOrigin::User);
+        let mut b = test_repo_view("b-clean-selected", false);
+        b.state = RepoOpState::Queued(QueueOrigin::User);
+        // Not selected, but dirty and under the cursor — a fallback-to-cursor
+        // bug would incorrectly pick this one up.
+        let c = test_repo_view("c-dirty-unselected", true);
+        app.repos = vec![a, b, c];
+        app.cursor = 2;
+
+        let dirty_targets = app.target_paths_where(|r| r.snapshot.dirty);
+
+        assert!(
+            dirty_targets.is_empty(),
+            "two repos are selected (both clean); the dirty, unselected \
+             cursor repo must not be silently substituted in: {dirty_targets:?}"
+        );
+    }
+
+    #[test]
+    fn target_paths_where_falls_back_to_cursor_when_nothing_selected() {
+        let mut app = App::new(GitRunner::default(), Mode::Pull, false, 0);
+        app.loading = false;
+        app.repos = vec![test_repo_view("only-repo", true)];
+        app.cursor = 0;
+
+        assert_eq!(
+            app.target_paths_where(|r| r.snapshot.dirty),
+            vec![PathBuf::from("only-repo")]
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_repo_pull_runs_without_confirmation() {
+        let mut app = App::new(GitRunner::default(), Mode::Pull, false, 0);
+        app.loading = false;
+        let mut a = test_repo_view("a", false);
+        a.state = RepoOpState::Queued(QueueOrigin::User);
+        let mut b = test_repo_view("b", false);
+        b.state = RepoOpState::Queued(QueueOrigin::User);
+        app.repos = vec![a, b];
+
+        app.run_action_on_targets(Mode::Pull);
+
+        assert!(
+            app.confirm_prompt.is_none(),
+            "pull/fetch/merge/rebase only read from the remote and write \
+             locally, so a multi-repo run must not require confirmation"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_repo_push_requires_confirmation() {
+        let mut app = App::new(GitRunner::default(), Mode::Pull, false, 0);
+        app.loading = false;
+        let mut a = test_repo_view("a", false);
+        a.state = RepoOpState::Queued(QueueOrigin::User);
+        let mut b = test_repo_view("b", false);
+        b.state = RepoOpState::Queued(QueueOrigin::User);
+        app.repos = vec![a, b];
+
+        app.run_action_on_targets(Mode::Push);
+
+        assert!(
+            app.confirm_prompt.is_some(),
+            "push changes what's on the remote, so a multi-repo push must \
+             still require confirmation"
+        );
+    }
+
     #[tokio::test]
     async fn ctrl_c_quits_even_when_prompt_is_open() {
         let mut app = App::new(GitRunner::default(), Mode::Pull, false, 0);
@@ -4137,88 +2120,5 @@ mod tests {
             .await
             .unwrap();
         assert!(quit);
-    }
-
-    #[test]
-    fn remote_short_ref_strips_remotes_prefix() {
-        assert_eq!(remote_short_ref("remotes/origin/main"), Some("origin/main"));
-        assert_eq!(
-            remote_short_ref("remotes/origin/feat/x"),
-            Some("origin/feat/x")
-        );
-        assert_eq!(remote_short_ref("main"), None);
-        assert_eq!(remote_short_ref("feature/remotes"), None);
-    }
-
-    #[test]
-    fn char_boundary_helpers_handle_multibyte() {
-        let s = "aöb";
-        assert_eq!(next_char_boundary(s, 0), 1);
-        assert_eq!(next_char_boundary(s, 1), 3); // 'ö' is two bytes
-        assert_eq!(next_char_boundary(s, s.len()), s.len());
-        assert_eq!(prev_char_boundary(s, 3), 1);
-        assert_eq!(prev_char_boundary(s, 1), 0);
-        assert_eq!(prev_char_boundary(s, 0), 0);
-    }
-
-    #[test]
-    fn parse_branch_name_extracts_current_branch() {
-        assert_eq!(
-            parse_branch_name("* main  abc1234 commit msg"),
-            Some("main")
-        );
-    }
-
-    #[test]
-    fn parse_branch_name_extracts_regular_branch() {
-        assert_eq!(
-            parse_branch_name("  feature/foo  abc1234 commit msg"),
-            Some("feature/foo")
-        );
-    }
-
-    #[test]
-    fn parse_branch_name_extracts_remote_branch() {
-        assert_eq!(
-            parse_branch_name("  remotes/origin/main  abc1234 commit msg"),
-            Some("remotes/origin/main")
-        );
-    }
-
-    #[test]
-    fn parse_branch_name_skips_symbolic_ref() {
-        assert_eq!(
-            parse_branch_name("  remotes/origin/HEAD -> origin/main"),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_branch_name_with_plus_marker() {
-        // The `+` marker is used for worktree-checked-out branches.
-        assert_eq!(parse_branch_name("+ develop  abc1234 msg"), Some("develop"));
-    }
-
-    #[test]
-    fn parse_branch_names_collects_set() {
-        let output = "\
-* main       abc1234 first commit
-  feature/a  def5678 second commit
-  feature/b  ghi9012 third commit
-  remotes/origin/HEAD -> origin/main
-  remotes/origin/main abc1234 first commit";
-        let names = parse_branch_names(output);
-        assert!(names.contains("main"));
-        assert!(names.contains("feature/a"));
-        assert!(names.contains("feature/b"));
-        assert!(names.contains("remotes/origin/main"));
-        // Symbolic refs should be excluded.
-        assert!(!names.iter().any(|n| n.contains("HEAD")));
-        assert_eq!(names.len(), 4);
-    }
-
-    #[test]
-    fn parse_branch_names_empty_input() {
-        assert!(parse_branch_names("").is_empty());
     }
 }

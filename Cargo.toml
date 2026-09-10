@@ -26,6 +26,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml = "0.9.34"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
+# Already pulled in transitively by ratatui (which uses it for the same
+# purpose: sizing terminal cells); declared directly here so gitbatch's own
+# column-truncation code can measure display width the same way ratatui does.
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"

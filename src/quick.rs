@@ -2,19 +2,13 @@ use std::path::PathBuf;
 
 use futures::{StreamExt, stream};
 
-use crate::{AppError, Result, git::GitRunner, mode::Mode};
+use crate::{AppError, Result, git::GitRunner, git::worker_limit, mode::Mode};
 
 pub async fn run(runner: &GitRunner, directories: Vec<PathBuf>, mode: Mode) -> Result<()> {
-    let Some(mode) = mode.quick_mode() else {
-        return Err(AppError::UnsupportedQuickMode(mode.to_string()));
-    };
-
-    let concurrency = std::thread::available_parallelism()
-        .map_or(4, |value| value.get() * 4)
-        .max(4);
+    let concurrency = worker_limit();
 
     let started = std::time::Instant::now();
-    let results = stream::iter(directories.into_iter().map(|directory| {
+    let mut results = stream::iter(directories.into_iter().map(|directory| {
         let runner = runner.clone();
         async move {
             let result = runner.run_mode(&directory, mode).await;
@@ -24,6 +18,10 @@ pub async fn run(runner: &GitRunner, directories: Vec<PathBuf>, mode: Mode) -> R
     .buffer_unordered(concurrency)
     .collect::<Vec<_>>()
     .await;
+    // `buffer_unordered` yields completion order, which varies run to run —
+    // sort by path so two runs over the same repos print identically.
+    // Script-friendly, deterministic output is the whole point of `-q`.
+    results.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     let total = results.len();
     let mut failed = 0usize;

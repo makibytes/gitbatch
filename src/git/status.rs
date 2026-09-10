@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use crate::{AppError, Result, git::GitRunner};
@@ -25,6 +25,8 @@ pub struct RepositorySnapshot {
     pub dirty: bool,
     /// True when the working tree has unresolved merge conflicts (unmerged paths).
     pub has_conflicts: bool,
+    /// HEAD's committer date, falling back to the repo directory's mtime for
+    /// a repo with no commits yet.
     pub last_modified: Option<SystemTime>,
     /// First line of the HEAD commit message, empty on new repos.
     pub commit_subject: String,
@@ -39,17 +41,31 @@ impl RepositorySnapshot {
         }
 
         let (status_result, log_result) = tokio::join!(
-            runner.run(
+            runner.run_readonly(
                 dir,
-                ["status", "--porcelain=v2", "--branch", "--show-stash"]
+                [
+                    "status",
+                    "--porcelain=v2",
+                    "--branch",
+                    "--show-stash",
+                    "--untracked-files=normal",
+                ]
             ),
-            runner.run(dir, ["log", "-1", "--pretty=format:%s"]),
+            runner.run_readonly(dir, ["log", "-1", "--pretty=format:%ct%n%s"]),
         );
         let output = status_result?;
-        let commit_subject = log_result
-            .ok()
-            .map(|o| o.stdout.trim().to_string())
-            .unwrap_or_default();
+        // First line is the HEAD commit's author-local timestamp (`%ct`),
+        // second is the subject (`%s`). Absent on a repo with no commits yet
+        // — `commit_timestamp` then falls back to the directory mtime below.
+        let (commit_timestamp, commit_subject) = match log_result {
+            Ok(o) => {
+                let mut lines = o.stdout.lines();
+                let ts = lines.next().and_then(|s| s.trim().parse::<u64>().ok());
+                let subject = lines.next().unwrap_or_default().trim().to_string();
+                (ts, subject)
+            }
+            Err(_) => (None, String::new()),
+        };
 
         let mut branch = BranchStatus::default();
         let mut dirty = false;
@@ -103,13 +119,21 @@ impl RepositorySnapshot {
             |value| value.to_string_lossy().into_owned(),
         );
 
+        // HEAD's committer date, not the directory's mtime: a build
+        // artifact or a stray touched file must not bump a repo to the top
+        // of the "recently modified" sort. Repos with no commits yet still
+        // fall back to the directory mtime.
+        let last_modified = commit_timestamp
+            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+            .or_else(|| metadata.modified().ok());
+
         Ok(Self {
             path: dir.to_path_buf(),
             name,
             branch,
             dirty,
             has_conflicts,
-            last_modified: metadata.modified().ok(),
+            last_modified,
             commit_subject,
             stash_count,
         })
@@ -184,6 +208,23 @@ mod tests {
             .await
             .unwrap();
         assert!(snap.dirty, "repo with untracked file must be dirty");
+    }
+
+    /// Safety checks must not inherit a user's setting that hides untracked
+    /// files, otherwise a pull can be treated as safe despite local files.
+    #[tokio::test]
+    async fn untracked_files_are_visible_despite_status_config() {
+        let repo = init_repo();
+        git(repo.path(), ["config", "status.showUntrackedFiles", "no"]);
+        fs::write(repo.path().join("new_file.txt"), "new\n").unwrap();
+
+        let snap = RepositorySnapshot::load(&GitRunner::default(), repo.path())
+            .await
+            .unwrap();
+        assert!(
+            snap.dirty,
+            "untracked files must remain visible to gitbatch"
+        );
     }
 
     /// A staged (indexed) change must mark the repo as dirty.
@@ -298,6 +339,41 @@ mod tests {
         assert_eq!(snap.branch.behind, 0);
         assert!(!snap.branch.no_upstream);
         assert!(!snap.dirty);
+    }
+
+    /// `last_modified` must track HEAD's committer date, not the directory's
+    /// mtime — otherwise a build artifact or a stray touched file bumps a
+    /// repo to the top of the "recently modified" sort for no git reason.
+    #[tokio::test]
+    async fn last_modified_uses_commit_date_not_directory_mtime() {
+        let repo = init_repo();
+        let old_date = "1000000000"; // 2001-09-09, far from "now"
+        Command::new("git")
+            .args(["commit", "--amend", "--no-edit"])
+            .env("GIT_COMMITTER_DATE", format!("{old_date} +0000"))
+            .env("GIT_AUTHOR_DATE", format!("{old_date} +0000"))
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+
+        // Bump the directory's own mtime well after the commit date — the
+        // old (directory-mtime-based) behavior would have picked this up.
+        fs::write(repo.path().join("bystander.txt"), "irrelevant\n").unwrap();
+
+        let snap = RepositorySnapshot::load(&GitRunner::default(), repo.path())
+            .await
+            .unwrap();
+
+        let modified = snap.last_modified.expect("repo has a commit");
+        let expected = SystemTime::UNIX_EPOCH + Duration::from_secs(old_date.parse().unwrap());
+        let delta = modified
+            .duration_since(expected)
+            .unwrap_or_else(|e| e.duration());
+        assert!(
+            delta < Duration::from_secs(5),
+            "last_modified must track the commit's committer date, not the \
+             directory mtime (delta = {delta:?})"
+        );
     }
 
     #[tokio::test]
